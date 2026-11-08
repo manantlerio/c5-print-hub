@@ -6,8 +6,10 @@
 #     per config), suspect alerts, ok = false alarm;
 #   3 flags with no ok between -> Sonnet decides: fail pauses, suspect alerts once (until the next ok), ok = nothing.
 # Only a Sonnet FAIL pauses (2026-10-30): a 'second suspect pauses' rule paused good black prints.
-# Two ways to reach Claude (config "watch_backend"): "api" = your own Anthropic API key, straight to the Messages API
-# (stdlib urllib, no SDK, so the hub stays stdlib only), or "cli" = the Claude Code CLI signed in on this PC.
+# Backends (config "watch_backend"): "api" = your own Anthropic API key, straight to the Messages API (stdlib urllib,
+# no SDK, so the hub stays stdlib only); "cli" = the Claude Code CLI signed in on this PC; "openai" = any server that
+# speaks OpenAI Chat Completions (OpenAI, Gemini, OpenRouter, Ollama, LM Studio). The Claude backends are the tested
+# ones. The OpenAI-compatible one is experimental: the prompt and the escalation rule were tuned on Claude only.
 # No sizes or heights in the context: from the low printer camera the model cannot judge them, and 'much smaller
 # than expected' was the main false flag (multi-part plates, black on the dark plate).
 # A pause is recoverable; a cancel is not.
@@ -94,11 +96,70 @@ API_URL = "https://api.anthropic.com/v1/messages"
 
 
 def backend(cfg):
-    """'api', 'cli' or '' (no AI checks: watcher off, drying bed check by eye)."""
+    """'api', 'cli', 'openai' or '' (no AI checks: watcher off, drying bed check by eye)."""
     b = (cfg.get("watch_backend") or "").lower()
     if b == "api" and cfg.get("anthropic_api_key"):
         return "api"
+    if b == "openai" and cfg.get("openai_base_url") and cfg.get("openai_model"):
+        return "openai"
     return "cli" if b == "cli" else ""
+
+
+VERDICTS = {"ok", "suspect", "fail", "empty", "not_empty", "unsure"}  # watcher prompt + drying bed check prompt
+NO_IMAGES = ("image", "vision", "multimodal", "multi-modal")
+
+
+def _data_uri(f):
+    mime = "image/png" if f.lower().endswith(".png") else "image/jpeg"
+    return f"data:{mime};base64," + base64.b64encode(open(f, "rb").read()).decode()
+
+
+def ask_openai(img, base_url, key, model, context="", timeout=120, view="printer", system=None, zoom=None):
+    """One verdict from an OpenAI-compatible server (Chat Completions, images as base64 data URIs).
+    Experimental. An answer that is not a verdict = 'unsure'; no answer (HTTP error, timeout) = 'error' (unreachable),
+    as for the Claude backends. A model that cannot take images says so in the reason ('no_images': True)."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    content = [{"type": "image_url", "image_url": {"url": _data_uri(f)}} for f in [img] + ([zoom] if zoom else [])]
+    content.append({"type": "text", "text": (context + "\n" if context else "") + "Verdict for this frame?"})
+    body = {"model": model, "messages": [{"role": "system", "content": (system or PROMPT).replace("{view}", VIEWS[view])},
+                                         {"role": "user", "content": content}]}
+    head = {"Content-Type": "application/json"}
+    if key:
+        head["Authorization"] = f"Bearer {key}"
+    try:
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=head)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode(errors="ignore")[:400]
+        try:
+            j = json.loads(msg)
+            j = j[0] if isinstance(j, list) and j else j  # Gemini can answer with a list
+            msg = (j.get("error") or {}).get("message") or j.get("message") or msg if isinstance(j, dict) else msg
+        except Exception:
+            pass
+        if e.code in (400, 404, 415, 422) and any(w in str(msg).lower() for w in NO_IMAGES):
+            return {"verdict": "error", "no_images": True,
+                    "reason": f"this model does not take images - pick a vision model ({msg})"[:200]}
+        return {"verdict": "error", "reason": f"unreachable: HTTP {e.code}: {msg}"[:200]}
+    except Exception as e:  # timeout, refused, DNS, bad JSON body
+        return {"verdict": "error", "reason": f"unreachable: {e}"[:200]}
+    try:
+        text = out["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return {"verdict": "unsure", "reason": f"no answer in the reply: {json.dumps(out)[:150]}", "cost": None}
+    if isinstance(text, list):  # some servers send content parts
+        text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+    m = re.search(r"\{[^{}]*\"verdict\"[^{}]*\}", text or "")
+    try:
+        v = json.loads(m.group(0)) if m else None
+    except ValueError:
+        v = None
+    if not isinstance(v, dict) or str(v.get("verdict")).lower() not in VERDICTS:
+        return {"verdict": "unsure", "reason": f"answer was not a verdict: {(text or '')[:150]}", "cost": None}
+    v["verdict"] = str(v["verdict"]).lower()
+    v["cost"] = None  # price unknown for other providers
+    return v
 
 
 def ask_claude(img, claude, cwd, context="", model="haiku", timeout=120, view="printer", system=None, zoom=None,
@@ -237,11 +298,19 @@ class Watcher:
 
     def set_enabled(self, on):
         if on and not backend(self.cfg):
-            raise ValueError("the watcher is not set up: open Setup - Watcher and add your API key or Claude Code")
+            raise ValueError("the watcher is not set up: open Setup - Watcher and choose an AI")
         self.state["enabled"] = bool(on)
 
-    def ask(self, img, context, model, view, zoom=None, system=None):
-        key = self.cfg.get("anthropic_api_key") if backend(self.cfg) == "api" else None
+    def ask(self, img, context, model, view, zoom=None, system=None, strong=False):
+        """model: the Claude model name. strong: the re-check (OpenAI-compatible: the strong model, or the fast one
+        when no strong model is set)."""
+        b = backend(self.cfg)
+        if b == "openai":
+            c = self.cfg
+            name = (c.get("openai_strong_model") if strong else "") or c.get("openai_model")
+            return ask_openai(img, c["openai_base_url"], c.get("openai_api_key") or "", name, context,
+                              float(c.get("openai_timeout_s", 120)), view, system, zoom)
+        key = self.cfg.get("anthropic_api_key") if b == "api" else None
         return ask_claude(img, self.claude, self.dir, context, model, view=view, system=system, zoom=zoom, api_key=key)
 
     def notify(self, msg, priority="high"):
@@ -318,11 +387,13 @@ class Watcher:
         """Second opinion on the frame that made an action due. Haiku loses a black part on the black plate a quarter
         of the time (test 2026-10-26: 7 of 28 good frames); Sonnet 3 of 28. No second model set = Haiku's verdict."""
         second = self.cfg.get("watch_confirm_model", "sonnet")
+        if backend(self.cfg) == "openai":
+            second = second or "strong"  # the OpenAI-compatible re-check always runs (strong model, or the fast one)
         if not second or not getattr(self, "last_frame", None):
             return dict(v)
         img, context, view, zoom = self.last_frame
         try:
-            return self.ask(img, context, second, view, zoom)
+            return self.ask(img, context, second, view, zoom, strong=True)
         except Exception as e:
             return {"verdict": "error", "reason": str(e)[:200]}
 
@@ -364,9 +435,9 @@ class Watcher:
             why = j.get("reason") if j["verdict"] == "fail" else f"{v.get('reason')} (second check failed: {j.get('reason')})"
             self.act(s, why, pause=True)
             return every
-        if j["verdict"] in ("suspect", "error") and not st.get("unsure_told"):
+        if j["verdict"] in ("suspect", "unsure", "error") and not st.get("unsure_told"):
             st["unsure_told"] = True
-            self.act(s, j.get("reason") if j["verdict"] == "suspect" else v.get("reason"), pause=False)
+            self.act(s, j.get("reason") if j["verdict"] in ("suspect", "unsure") else v.get("reason"), pause=False)
             return 90
         return every  # second opinion says ok: false alarm
 

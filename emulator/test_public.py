@@ -113,6 +113,38 @@ def main(template):
     check("API watcher without a key refused", code == 400, r)
     code, r = call("/api/setup/watcher", {"backend": "api", "api_key": "abc"})
     check("not an Anthropic key refused", code == 400, r)
+    # OpenAI-compatible backend (experimental) against the local mock server, and the Test button for it
+    sys.path.insert(0, HERE)
+    import mock_openai
+    srv, murl = mock_openai.start()
+    oa = lambda model, **k: call("/api/setup/watcher", dict({"backend": "openai", "preset": "custom", "base_url": murl,
+                                                             "model": model, "openai_key": "local-test-key"}, **k))
+    code, r = oa("")
+    check("OpenAI-compatible without a model refused", code == 400 and "model" in r.get("error", ""), r)
+    code, r = oa("good", base_url="not a url")
+    check("OpenAI-compatible bad address refused", code == 400, r)
+    code, r = oa("good")
+    check("OpenAI-compatible backend saved", code == 200 and r.get("backend") == "openai"
+          and r["openai"]["model"] == "good" and r["openai"]["key_end"] == "-key", r)
+    code, raw, _ = call("/api/setup", raw=True)
+    check("setup page never shows the saved key", b"local-test-key" not in raw)
+    code, v = call("/api/setup/watcher/test", {})
+    check("Test button: good verdict", code == 200 and v.get("verdict") == "ok", v)
+    check("Test sent the real camera frame", mock_openai.LAST["body"]["messages"][1]["content"][0]["image_url"]["url"]
+          .startswith("data:image/jpeg;base64,/9j/"), str(mock_openai.LAST.get("body"))[:120])
+    oa("noimage")
+    code, v = call("/api/setup/watcher/test", {})
+    check("Test button: model without images gives a plain error", v.get("verdict") == "error"
+          and "does not take images" in v.get("reason", ""), v)
+    oa("garbled")
+    code, v = call("/api/setup/watcher/test", {})
+    check("Test button: garbled answer shows as unsure", v.get("verdict") == "unsure", v)
+    oa("http500")
+    code, v = call("/api/setup/watcher/test", {})
+    check("Test button: server error shows as unreachable", v.get("verdict") == "error"
+          and v.get("reason", "").startswith("unreachable"), v)
+    srv.shutdown()
+
     code, r = call("/api/setup/watcher", {"backend": "", "enabled": True})
     check("watcher stays off with no backend", code == 200 and r.get("enabled") is False and r.get("backend") == "", r)
 

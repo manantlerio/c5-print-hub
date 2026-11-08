@@ -27,8 +27,8 @@ Use it at your own risk: it sends real commands to a real printer.
 - **Drying mode**: holds bed and chamber heat for a set time with spools on the bed, and locks printing until the bed
   is checked empty again (by camera with the watcher, or by you, by eye).
 - **Detail mode**: finer layers only where slopes and curves would show steps.
-- **Failure watcher (optional, off by default)**: Claude looks at a camera frame every few minutes and pauses the
-  print on a clear failure.
+- **Failure watcher (optional, off by default)**: an AI looks at a camera frame every few minutes and pauses the
+  print on a clear failure. Claude is the tested choice; other OpenAI-compatible AIs work as an experimental option.
 - **Push alerts (optional)**: through ntfy.sh when a print finishes, pauses or errors.
 
 ## What you need
@@ -83,20 +83,29 @@ listens on the PC only and `tailscale serve` passes your own devices through. Do
 
 ## Failure watcher (optional)
 
-Off until you set it up. During a print, Claude (Haiku) looks at one camera frame every 2 minutes, told what colours
+Off until you set it up. During a print, a fast model looks at one camera frame every 2 minutes, told what colours
 should be on the plate and whether there is a prime tower. A flag gets a quick re-check on a fresh frame. Only when an
-action is due does a second model (Sonnet) look: it pauses the print on a clear failure (spaghetti, a part knocked
-loose, a big blob), or sends one alert when unsure. A pause can be resumed; the watcher never cancels.
+action is due does a stronger model look: it pauses the print on a clear failure (spaghetti, a part knocked loose, a
+big blob), or sends one alert when unsure. A pause can be resumed; the watcher never cancels.
 
-Two ways to run it:
+Ways to run it:
 
-- **Your own Anthropic API key**: make a key at [console.anthropic.com](https://console.anthropic.com) and paste it
-  on the setup page. Each check sends one camera frame to Anthropic and is billed to your account, a small fraction
-  of a cent per check. The key is stored in plain text in `config.json` on this PC.
-- **Claude Code on this PC**: if you already use the Claude Code CLI and are signed in, the hub can call it instead.
+- **Claude, your own Anthropic API key (tested)**: make a key at
+  [console.anthropic.com](https://console.anthropic.com) and paste it on the setup page. Haiku looks, Sonnet
+  re-checks. Each check sends one camera frame to Anthropic and is billed to your account, a small fraction of a cent
+  per check.
+- **Claude Code on this PC (tested)**: if you already use the Claude Code CLI and are signed in, the hub can call it
+  instead.
+- **Other AI, OpenAI-compatible (experimental - not tuned, may miss failures or pause good prints)**: any service or
+  local server with an OpenAI-style Chat Completions API and a model that can read images. The setup page has presets
+  for OpenAI, Google Gemini, OpenRouter, Ollama (local, `http://localhost:11434/v1`) and LM Studio (local,
+  `http://localhost:1234/v1`). Type the server address, an API key (blank for a local server), a fast model and
+  optionally a strong model for the re-check (blank = the fast model again). The model names the presets fill in are
+  examples only. The prompt and the pause rule were tuned on Claude, so watch the first prints closely.
 
-Tap Test on the setup page to try one check on the printer camera. Without the watcher, the drying bed check asks
-you to look at the bed yourself and unlock it.
+API keys are stored in plain text in `config.json` on this PC and never shown on the page again. Tap Test on the
+setup page to try one check on the printer camera with the AI you chose; a model that cannot read images gives a
+plain error there. Without the watcher, the drying bed check asks you to look at the bed yourself and unlock it.
 
 ## Config (`config.json`)
 
@@ -109,7 +118,9 @@ by hand:
 | `host` | 0.0.0.0 | 0.0.0.0 = phones on your network; 127.0.0.1 = this PC only (Tailscale) |
 | `watch_every_min` | 2 | minutes between watcher checks |
 | `watch_action` | pause | `pause`, or `alert` (push only) |
-| `watch_model` / `watch_confirm_model` | haiku / sonnet | first look and second opinion; empty second = first decides |
+| `watch_model` / `watch_confirm_model` | haiku / sonnet | Claude: first look and second opinion; empty second = first decides |
+| `openai_base_url`, `openai_model`, `openai_strong_model` | empty | OpenAI-compatible watcher (experimental), set on the setup page |
+| `openai_timeout_s` | 120 | seconds to wait for an OpenAI-compatible answer (local models can be slow) |
 | `webcam_url`, `webcam_fps` | empty, 8 | phone camera address |
 | `ntfy_topic` | empty | push alerts through ntfy.sh (pick a long random topic name) |
 | `leveling` | false | bed leveling before each print |
@@ -123,12 +134,16 @@ Restart the hub after editing `config.json` by hand (Task Scheduler, C5 Print Hu
 
 ## Tests
 
-Offline, no printer, Flash Studio or Claude needed:
+Offline, no printer, Flash Studio or AI needed:
 
 ```
 python -I emulator\test_public.py
 python -I emulator\test_watcher.py
+python -I emulator\test_openai.py
 ```
+
+`test_openai.py` runs the OpenAI-compatible watcher against `emulator\mock_openai.py`, a stand-in server on this PC:
+a good verdict, a garbled reply, HTTP errors, a timeout and a model that cannot read images.
 
 `test_public.py` runs a fresh hub against `emulator\fake_printer.py` (a stand-in Creator 5 Pro on this PC) through
 the whole first run: setup page, PIN, cameras, template, watcher, phone page, send, pause, cancel. Add

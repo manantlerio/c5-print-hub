@@ -20,8 +20,11 @@ DEFAULTS = {"setup_done": False, "printer_ip": "", "serial": "", "check_code": "
             "colours": ["#FFFFFF", "#1E5BD8", "#F5D000", "#FF69B4"], "leveling": False,
             # Phone webcam (an IP camera app), e.g. "http://192.168.1.50:8080"; "" = printer camera only.
             "webcam_url": "", "webcam_fps": 8,
-            # Failure watcher: off until set up. watch_backend "api" (your own Anthropic API key) or "cli" (Claude Code).
+            # Failure watcher: off until set up. watch_backend "api" (your own Anthropic API key), "cli" (Claude Code)
+            # or "openai" (any OpenAI-compatible server: experimental).
             "watch": False, "watch_backend": "", "anthropic_api_key": "", "watch_every_min": 2, "watch_action": "pause",
+            "openai_preset": "", "openai_base_url": "", "openai_api_key": "", "openai_model": "", "openai_strong_model": "",
+            "openai_timeout_s": 120,
             "ntfy_topic": "",
             # Slicer: "flashstudio", or "forkaslicer" (an OrcaSlicer fork in WSL, falls back to Flash Studio if it fails).
             "engine": "flashstudio",
@@ -468,7 +471,7 @@ def dry_judge(img, prompt, view):
         return {"verdict": fixed, "reason": "simulator verdict"}
     if not watcher.backend(CFG):
         return {"verdict": "unsure", "reason": "no AI check set up - look at the bed yourself, then use the unlock"}
-    return WATCH.ask(img, "", CFG.get("dry_check_model", "sonnet"), view, system=prompt)
+    return WATCH.ask(img, "", CFG.get("dry_check_model", "sonnet"), view, system=prompt, strong=True)
 
 
 DRY = dryer.Dryer(CFG, PR, summary, log, WATCH.notify,
@@ -1475,7 +1478,7 @@ def setup_state():
             tpl = template_info(slicer.TEMPLATE)
         except Exception as e:
             tpl = {"problems": [str(e)]}
-    key = CFG.get("anthropic_api_key") or ""
+    key, okey = CFG.get("anthropic_api_key") or "", CFG.get("openai_api_key") or ""
     return {"name": NAME, "setup_done": bool(CFG.get("setup_done")), "local": True,
             "printer": {"ip": CFG["printer_ip"], "serial_set": bool(CFG["serial"]), "check_set": bool(CFG["check_code"]),
                         "online": s["online"], "status": s.get("status"), "error": s.get("error")},
@@ -1486,6 +1489,9 @@ def setup_state():
             "template": tpl, "fs_slices": os.path.isdir(FS_SLICES),
             "watcher": {"backend": watcher.backend(CFG), "chosen": CFG.get("watch_backend") or "",
                         "key_end": key[-4:] if key else "", "enabled": WATCH.state["enabled"],
+                        "openai": {"preset": CFG.get("openai_preset") or "", "base_url": CFG.get("openai_base_url") or "",
+                                   "model": CFG.get("openai_model") or "", "strong_model": CFG.get("openai_strong_model") or "",
+                                   "key_end": okey[-4:] if okey else ""},
                         "claude_cli": bool(shutil.which("claude") or os.path.exists(WATCH.claude or ""))},
             "scan": SCAN}
 
@@ -1592,9 +1598,22 @@ def setup_route(h, method, p, q):
         return h.send(200, info)
     if p == "/api/setup/watcher" and method == "POST":
         b = req.get("backend") or ""
-        if b not in ("", "api", "cli"):
+        if b not in ("", "api", "cli", "openai"):
             raise ValueError("unknown watcher choice")
         ch = {"watch_backend": b}
+        if b == "openai":
+            url = (req.get("base_url") or "").strip()
+            if urlparse(url).scheme not in ("http", "https") or not urlparse(url).hostname:
+                raise ValueError("type the server address, like https://api.openai.com/v1")
+            model = (req.get("model") or "").strip()
+            if not model:
+                raise ValueError("type the model name (one that can read images)")
+            ch.update(openai_preset=str(req.get("preset") or "")[:20], openai_base_url=url, openai_model=model,
+                      openai_strong_model=(req.get("strong_model") or "").strip())
+            if (req.get("openai_key") or "").strip():
+                ch["openai_api_key"] = req["openai_key"].strip()
+            if req.get("forget_openai_key"):
+                ch["openai_api_key"] = ""
         if b == "api":
             key = (req.get("api_key") or "").strip()
             if key and not key.startswith("sk-ant-"):
@@ -1613,7 +1632,7 @@ def setup_route(h, method, p, q):
         return h.send(200, setup_state()["watcher"])
     if p == "/api/setup/watcher/test" and method == "POST":  # one real check on a printer camera frame
         if not watcher.backend(CFG):
-            raise ValueError("choose the API key or Claude Code first and save")
+            raise ValueError("choose an AI for the watcher first and save")
         f = CAM.snapshot(20)
         if not f:
             raise ValueError("the printer camera is not answering, so there is no frame to test with")
