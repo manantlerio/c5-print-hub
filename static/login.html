@@ -3,8 +3,24 @@
 <meta name="theme-color" content="#14161a"><link rel="manifest" href="/manifest.json"><link rel="icon" href="/icon.svg"><title>C5 Print Hub</title>
 <style>body{margin:0;background:#14161a;color:#eef0f3;font:18px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;padding:16px;box-sizing:border-box}
 form{width:100%;max-width:340px}input,button{width:100%;font:inherit;padding:16px;border-radius:12px;border:1px solid #2e323a;margin-top:10px;box-sizing:border-box}
-input{background:#1f2228;color:#eef0f3;font-size:28px;letter-spacing:.3em;text-align:center}button{background:#3d8bfd;color:#fff;border:0;font-weight:700}#e{color:#ff9b9e;min-height:1.4em;margin-top:10px}</style></head>
-<body><form onsubmit="go(event)"><h2 style="margin:0">C5 Print Hub</h2><input id="p" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN" autofocus>
+input{background:#1f2228;color:#eef0f3;font-size:24px;text-align:center}#p.pin{font-size:28px;letter-spacing:.3em}button{background:#3d8bfd;color:#fff;border:0;font-weight:700}#e{color:#ff9b9e;min-height:1.4em;margin-top:10px}
+.dim{color:#9aa1ac;font-size:14px;margin-top:6px}</style></head>
+<body data-mode="__MODE__"><form id="f"><h2 style="margin:0">C5 Print Hub</h2>
+<div class="dim" id="hint"></div>
+<input id="p" type="password" autocomplete="current-password" autofocus>
+<input id="c" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" maxlength="6" style="display:none">
 <button>Open</button><div id="e"></div></form>
-<script>async function go(ev){ev.preventDefault();const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:document.getElementById("p").value})});
-if(r.ok)location.reload();else document.getElementById("e").textContent="Wrong PIN";}</script></body></html>
+<script>
+const remote = document.body.dataset.mode === "remote", $ = id => document.getElementById(id);
+if (remote) { $("p").placeholder = "Passphrase"; $("c").style.display = ""; $("hint").textContent = "Away from home: your passphrase and the code from your authenticator app."; }
+else { $("p").placeholder = "PIN"; $("p").inputMode = "numeric"; $("p").className = "pin"; }
+$("f").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const body = remote ? {passphrase: $("p").value, code: $("c").value} : {password: $("p").value};
+  const r = await fetch("/login", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  if (r.ok) return location.reload();
+  const j = await r.json().catch(() => ({}));
+  $("e").textContent = j.error || (remote ? "Wrong passphrase or code" : "Wrong PIN");
+  if (remote) $("c").value = "";
+});
+</script></body></html>

@@ -29,7 +29,10 @@ Use it at your own risk: it sends real commands to a real printer.
 - **Detail mode**: finer layers only where slopes and curves would show steps.
 - **Failure watcher (optional, off by default)**: an AI looks at a camera frame every few minutes and pauses the
   print on a clear failure. Claude is the tested choice; other OpenAI-compatible AIs work as an experimental option.
-- **Push alerts (optional)**: through ntfy.sh when a print finishes, pauses or errors.
+- **Push alerts (optional)**: through ntfy (ntfy.sh or your own server) when a print finishes, pauses or errors, and
+  on every new sign-in, remote start and remote cancel.
+- **Remote access (optional)**: Tailscale, a Cloudflare Tunnel, or the hub's own HTTPS port, with a passphrase and an
+  authenticator code. Full control from away, the same as at home. See [Security and remote access](#security-and-remote-access).
 
 ## What you need
 
@@ -52,10 +55,12 @@ Use it at your own risk: it sends real commands to a real printer.
    powershell -ExecutionPolicy Bypass -File setup.ps1
    ```
 
-   It finds Python, starts the hub now and at every login, and opens the setup page. Windows may block a downloaded
-   script: if so, right-click `setup.ps1`, Properties, tick Unblock, and run it again.
-4. When Windows asks whether Python may use networks, allow **Private networks** only.
-5. On the setup page (`http://127.0.0.1:8765/setup` on this PC):
+   It finds Python, starts the hub now and at every login, adds a firewall rule for your home network only (Windows
+   asks once for administrator rights), and opens the one-time setup link. Windows may block a downloaded script: if
+   so, right-click `setup.ps1`, Properties, tick Unblock, and run it again.
+4. If Windows asks whether Python may use networks, allow **Private networks** only.
+5. On the setup page (the link is also in `setup-url.txt` in the folder; it works on this PC only, until setup is
+   done):
    1. **Printer**: Find my printer (or type its address), then the serial number and check code from the printer
       screen. Connect and test.
    2. **PIN**: the PIN your phone asks for once.
@@ -67,19 +72,114 @@ Use it at your own risk: it sends real commands to a real printer.
    5. **Watcher**: optional, see below.
    6. **Done**: the page shows the address to open on your phone, like `http://192.168.1.20:8765`. Add it to your home
       screen.
+   7. Optional, any time later from the setup page: **Phone alerts** (ntfy) and **Remote access**.
 
 To run it by hand instead of at login: `python -I hub.py`. To remove the login task:
 `powershell -ExecutionPolicy Bypass -File setup.ps1 -Uninstall`.
 
-## Keep it off the internet
+## Security and remote access
 
-The hub is made for your own home network. **Never forward its port on your router, and never put it on the open
-internet.** Anyone who reaches it and guesses the PIN can heat the bed and nozzles and start a print on your printer.
-The PIN only keeps out people on your own Wi-Fi.
+The hub controls heaters and motors, so it is built to keep strangers out while you keep full control. At home you
+use a PIN. Away from home you use a passphrase and a 6-digit code from an authenticator app, and then you can do
+everything you can do at home: start a print, pause, cancel, temperatures, speed, uploads, drying.
 
-For access away from home, use [Tailscale](https://tailscale.com) (free for personal use): install it on the PC and
-your phone, sign in on both, then run `powershell -ExecutionPolicy Bypass -File setup.ps1 -Tailscale`. The hub then
-listens on the PC only and `tailscale serve` passes your own devices through. Do not use `tailscale funnel`.
+### What is protected
+
+- **The home port** (8765) is plain http for your own network. It refuses internet addresses, and anything that came
+  through a proxy or tunnel, so a forwarded router port gets nothing. `setup.ps1` limits it in the Windows Firewall to
+  the Private profile and your local subnet.
+- **First run**: the setup page opens only with the one-time link from `setup-url.txt`, and until setup is done the
+  hub listens on this PC only.
+- **Login**: a few wrong PINs from one address make it wait, doubling each time; many wrong tries from anywhere slow
+  every try down and then pause home login for 15 minutes. Every miss is logged in `hub.log`. Right and wrong answers
+  take the same time.
+- **Devices**: every phone or browser gets its own random session (the hub keeps only a hash of it), 30 days at home
+  and 7 days remote, renewed as you use it. The setup page lists them with a sign-out button. A new PIN signs out
+  every other home device; a new passphrase or authenticator signs out every remote one.
+- **Remote login**: a passphrase of 12 or more characters plus the authenticator code, each code once. After 20
+  wrong tries in an hour remote login locks until you log in once at home (or tap Open remote login again on the
+  setup page), and your phone gets a push. A phone already signed in remotely keeps working.
+- **Alerts**: a push on every new sign-in, every remote start and every remote cancel. Every remote action is logged
+  with the device name.
+- **Changes that move secrets or traffic** (printer address, camera address, AI address or key, alerts, PIN,
+  passphrase) ask for the passphrase again (the PIN when no passphrase is set). One yes covers 10 minutes.
+- **Safe remote start**: the Send sheet shows a fresh camera frame and the time it was taken. Tap **Mark bed cleared**
+  after you look at the bed (at home or on the camera). If a remote start comes with no mark since the last print
+  ended, the hub asks once more before it starts. It never refuses: you decide.
+- **Hard limits nothing overrides**: a file is never sent if it heats the nozzle over 300 C, the bed over 110 C or the
+  chamber over 65 C (set lower with `hard_caps`), or if it holds a firmware-level command such as `SAVE_CONFIG`,
+  `FIRMWARE_RESTART`, `M500`, `M502`, `M997`, `M302`, `M211` or a forced move. The check reads every spelling the
+  firmware would (lower case, leading spaces, line numbers, Klipper commands and macros, the R parameter). Send
+  anyway only skips the soft checks (material ranges, presets, design). The printer's own firmware limits were not
+  tested by this project.
+- **Requests**: only this hub's own page can make changes (Host check, Origin check, JSON or file bodies only).
+  Sizes, time and connections are capped, so a flood or a slow client cannot lock your phone out. Uploads go
+  straight to disk; a 3MF that unpacks to more than 500 MB is refused.
+- **What the hub fetches**: camera addresses must be on your home network, redirects are never followed and only
+  pictures pass through. An AI address must be https unless it is your own server on this PC or network; a saved key
+  is cleared when the address changes, and the server's own reply text is never shown.
+- **Pages**: printer names and colours are checked before they reach the page; the pages cannot be framed by
+  another site and load nothing from anywhere else.
+- **Secrets on disk**: the PIN and passphrase are stored as scrypt hashes. API keys, the printer check code and the
+  ntfy token are in plain text in `config.json`, so keep the folder inside your own Windows user profile.
+- **hubctl.py** uses a random API token from `config.json`, accepted from this PC only. The PIN is never an API key.
+
+### Away from home: pick one
+
+**Never forward the home port (8765) on your router.** Pick one of these instead. All three keep the full controls.
+
+**A. Tailscale (most private, nothing open to the internet).** Free for personal use; it needs the Tailscale app on
+every phone that uses the hub.
+
+1. Install [Tailscale](https://tailscale.com/download) on the hub PC and your phone, signed in to the same account.
+2. Run `powershell -ExecutionPolicy Bypass -File setup.ps1 -Tailscale`. The home port then also answers Tailscale
+   addresses (`"tailscale": true`), and the firewall rule includes them.
+3. On the phone open `http://<the PC's Tailscale address>:8765` (the 100.x address from the Tailscale app) and log in
+   with your PIN, as at home. To use the PC's full Tailscale name instead, add it to `lan_hosts` in `config.json`,
+   for example `"lan_hosts": ["printpc.tail1234.ts.net"]`.
+
+Never use `tailscale funnel` (it puts the hub on the open internet). If an older version set up `tailscale serve`
+for you, remove it with `tailscale serve reset`: the home port now refuses proxied requests.
+
+**B. Cloudflare Tunnel with Cloudflare Access (no open port, works in any browser).** Needs a domain on Cloudflare
+(about US$10 a year) and a free Cloudflare account. Cloudflare carries the traffic and can see it.
+
+1. At home, on the setup page: **Remote access**, set a passphrase and an authenticator.
+2. In `config.json` set `"remote_tunnel_port": 8766` and `"remote_hosts": ["hub.example.com"]` (your own name), then
+   restart the hub. Port 8766 listens on this PC only (127.0.0.1); the hub treats everything on it as remote.
+3. Install cloudflared on the hub PC: `winget install --id Cloudflare.cloudflared`.
+4. In the Cloudflare dashboard, Zero Trust, Networks, Tunnels: **Create a tunnel** (Cloudflared), give it a name, and
+   run the install command it shows (`cloudflared.exe service install ...`) in an administrator terminal.
+5. In the tunnel, add a **public hostname**: subdomain `hub`, your domain, service type **HTTP**, URL
+   `127.0.0.1:8766`. Never point it at 8765.
+6. Zero Trust, Access, Applications: **Add an application**, Self-hosted, domain `hub.example.com`. Add a policy:
+   action Allow, include Emails, your own address. Keep the one-time PIN login method. Save.
+7. On the phone open `https://hub.example.com`. Cloudflare asks for your email and a code first, then the hub asks
+   for your passphrase and authenticator code. Add it to the home screen.
+
+**C. The hub's own HTTPS port, with a router port forward.** For when you have no domain on Cloudflare and do not
+want an app on every phone. The hub then faces the internet directly: it is built for that (the lockout, caps and
+timeouts above), but A and B keep strangers from reaching it at all.
+
+1. At home, on the setup page: **Remote access**, set a passphrase and an authenticator.
+2. Get a name that points at your home: a free [DuckDNS](https://www.duckdns.org) name, or one on your own domain.
+3. Get a certificate for that name as PEM files, with [win-acme](https://www.win-acme.com) (choose the PEM files
+   store) or [Caddy](https://caddyserver.com). DNS validation (DuckDNS has a token for it) needs no extra open port;
+   HTTP validation needs port 80 forwarded while it renews. Python cannot get certificates by itself.
+4. In `config.json` set `"remote_https_port": 8443`, `"tls_cert"` and `"tls_key"` to the two PEM files (in
+   JSON, write `\\` for each `\` in a path), and `"remote_hosts": ["myhub.duckdns.org"]`. Restart the hub.
+5. Run `powershell -ExecutionPolicy Bypass -File setup.ps1 -HttpsPort 8443` for the firewall rule.
+6. On the router forward TCP 8443 to this PC, port 8443. Only that port.
+7. On the phone open `https://myhub.duckdns.org:8443` and log in with your passphrase and code.
+
+The hub reads the certificate when it starts: restart it after each renewal (win-acme can run
+`schtasks /End /TN "C5 Print Hub"` and `schtasks /Run /TN "C5 Print Hub"` after it renews). A self-signed
+certificate makes phones warn every time; use it for testing only.
+
+### Upgrading from an older version
+
+Every phone logs in once more (sessions replaced the shared cookie). `hubctl.py` now uses `api_token` from
+`config.json`. A PIN stored in plain text by an older version is hashed at the first start.
 
 ## Failure watcher (optional)
 
@@ -114,15 +214,21 @@ by hand:
 
 | Key | Default | What it does |
 |---|---|---|
-| `port` | 8765 | port of the phone page |
-| `host` | 0.0.0.0 | 0.0.0.0 = phones on your network; 127.0.0.1 = this PC only (Tailscale) |
+| `port` | 8765 | port of the phone page (home network only) |
+| `host` | 0.0.0.0 | 0.0.0.0 = phones on your network; 127.0.0.1 = this PC only |
+| `tailscale` | false | the home port also answers Tailscale addresses (set by `setup.ps1 -Tailscale`) |
+| `lan_hosts` | none | extra names the home port answers to, e.g. the PC's Tailscale name |
+| `remote_tunnel_port` | 0 (off) | remote port on 127.0.0.1 for a Cloudflare Tunnel |
+| `remote_https_port`, `tls_cert`, `tls_key` | 0 (off), empty | remote HTTPS port and your certificate (PEM files) |
+| `remote_hosts` | none | the names your remote address uses, e.g. `hub.example.com` (needed for remote ports) |
+| `hard_caps` | nozzle 300, bed 110, chamber 65 | temperatures no file may go over; can only be set lower |
 | `watch_every_min` | 2 | minutes between watcher checks |
 | `watch_action` | pause | `pause`, or `alert` (push only) |
 | `watch_model` / `watch_confirm_model` | haiku / sonnet | Claude: first look and second opinion; empty second = first decides |
 | `openai_base_url`, `openai_model`, `openai_strong_model` | empty | OpenAI-compatible watcher (experimental), set on the setup page |
 | `openai_timeout_s` | 120 | seconds to wait for an OpenAI-compatible answer (local models can be slow) |
 | `webcam_url`, `webcam_fps` | empty, 8 | phone camera address |
-| `ntfy_topic` | empty | push alerts through ntfy.sh (pick a long random topic name) |
+| `ntfy_server`, `ntfy_topic`, `ntfy_token` | ntfy.sh, empty, empty | push alerts, set on the setup page |
 | `leveling` | false | bed leveling before each print |
 | `material_ranges` | PLA, PETG, TPU | nozzle and bed ranges a sliced file must stay inside |
 | `z_offset_by_material` | none | extra Z per material at send, mm, + = higher, e.g. `{"PETG": 0.05}` |
@@ -140,7 +246,14 @@ Offline, no printer, Flash Studio or AI needed:
 python -I emulator\test_public.py
 python -I emulator\test_watcher.py
 python -I emulator\test_openai.py
+python -I emulator\test_security.py
 ```
+
+`test_security.py` checks each security fix against a fresh hub: the setup link, brute force and lockout, bad
+Content-Length, slow and idle clients, the connection cap, Host and Origin rules, sessions and sign-out, the remote
+port with passphrase and authenticator code (RFC 6238 test vectors), step-up, safe remote start, the G-code hard
+check (lower case, macros, leading spaces, the R parameter), camera and AI redirects, zip bombs, page escaping and
+security headers. With `openssl` on the PATH (Git for Windows has it) it also tries the HTTPS port.
 
 `test_openai.py` runs the OpenAI-compatible watcher against `emulator\mock_openai.py`, a stand-in server on this PC:
 a good verdict, a garbled reply, HTTP errors, a timeout and a model that cannot read images.
@@ -155,10 +268,11 @@ copy of the hub against the fake printer to try things by hand (`--fresh` starts
 `hub.py` server and page API, `printer.py` printer LAN client and camera, `slicer.py` slicing, checks and stats,
 `slicer_scripts\` model and settings builders for the Flash Studio slicer, `watcher.py` failure watcher,
 `dryer.py` drying mode, `design_check.py` design check, `detail.py` Detail mode, `toolpath.py` 3D viewer data,
-`hubctl.py` command line, `static\` phone and setup pages, `emulator\` fake printer and tests.
+`hubctl.py` command line, `security.py` sessions, login limits, TOTP and address checks, `static\` phone and setup
+pages, `emulator\` fake printer and tests.
 
-Not in the repo (made on your PC): `config.json`, `template\` (your Flash Studio export), `jobs\`, `watch\`,
-`drying\`, `hub.log`.
+Not in the repo (made on your PC): `config.json`, `sessions.json`, `setup-url.txt`, `template\` (your Flash
+Studio export), `jobs\`, `watch\`, `drying\`, `hub.log`.
 
 ## Licence
 

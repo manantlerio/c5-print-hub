@@ -1,6 +1,9 @@
 # your own settings and keys (printer serial, check code, PIN, API key)
 config.json
 config.json.*
+sessions.json
+sessions.json.*
+setup-url.txt
 *.bak*
 
 # local state: logs, jobs, watcher frames, drying, print records

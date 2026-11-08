@@ -2,6 +2,7 @@
 # Wire format taken from @ghosttypes/ff-api 2.1.0 (Creator5Backend / JobControl), checked against our printer.
 # The control API answers only in LAN Only mode; the camera answers in either mode.
 import json, os, threading, time, urllib.request, uuid
+import security
 
 
 class Printer:
@@ -15,10 +16,10 @@ class Printer:
         req = urllib.request.Request(f"http://{self.ip}:8898{path}", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         if not locked:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode(errors="ignore") or "{}")
-        with self.lock, urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode(errors="ignore") or "{}")
+            with security.urlopen(req, timeout) as r:
+                return json.loads(r.read(1_000_000).decode(errors="ignore") or "{}")
+        with self.lock, security.urlopen(req, timeout) as r:
+            return json.loads(r.read(1_000_000).decode(errors="ignore") or "{}")
 
     def _auth(self):
         return {"serialNumber": self.serial, "checkCode": self.check}
@@ -66,8 +67,8 @@ class Printer:
                    "flowCalibration": "false", "timeLapseVideo": "false", "useMatlStation": "true",
                    "gcodeToolCnt": str(max(1, tools)), "Content-Type": f"multipart/form-data; boundary={boundary}"}
         req = urllib.request.Request(f"http://{self.ip}:8898/uploadGcode", data=body, headers=headers)
-        with urllib.request.urlopen(req, timeout=300) as r:
-            return json.loads(r.read().decode(errors="ignore") or "{}")
+        with security.urlopen(req, 300) as r:
+            return json.loads(r.read(1_000_000).decode(errors="ignore") or "{}")
 
     def start(self, name, leveling, mappings=None):
         body = {**self._auth(), "fileName": name, "levelingBeforePrint": bool(leveling),
@@ -82,9 +83,11 @@ class Camera:
 
     FRESH_AFTER = 2  # frames a new stream sends before its picture is current
 
-    def __init__(self, ip=None, url=None, fps=0, wake=20):
+    def __init__(self, ip=None, url=None, fps=0, wake=20, guard=None):
         # url: any MJPEG stream (the phone webcam). fps caps what is passed on; the phone sends ~58 fps.
+        # guard(url) -> the address to really open (checked and resolved again at every connect), or ValueError.
         self.url = url or f"http://{ip}:8080/?action=stream"
+        self.guard = guard
         self.gap = 1.0 / fps if fps else 0.0
         self.wake = wake  # seconds to wait for a first frame from a cold stream (the printer's can take >10 s)
         self.frame, self.frame_time, self.users = None, 0.0, 0
@@ -137,7 +140,12 @@ class Camera:
                     continue
                 idle_since = None
             try:
-                with urllib.request.urlopen(self.url, timeout=10) as s:
+                # No redirects; only a picture or an MJPEG stream is read, so nothing else a server sends ever
+                # reaches a page (the camera test and preview fetch addresses typed on the setup page).
+                with security.urlopen(self.guard(self.url) if self.guard else self.url, 10) as s:
+                    ctype = (s.headers.get("Content-Type") or "").lower()
+                    if not ctype.startswith(("multipart/", "image/")):
+                        raise ValueError(f"not a camera stream ({ctype[:40] or 'no content type'})")
                     with self.cv:
                         self.seq = 0
                     buf = b""
@@ -153,6 +161,8 @@ class Camera:
                             if a < 0 or b < 0:
                                 break
                             frame, buf = buf[a:b + 2], buf[b + 2:]
+                            if frame[:3] != b"\xff\xd8\xff":  # a JPEG starts FF D8 FF; anything else is not a picture
+                                frame = None
                         if frame and time.time() - self.frame_time >= self.gap:
                             with self.cv:
                                 self.frame, self.frame_time = frame, time.time()
@@ -163,5 +173,6 @@ class Camera:
                         with self.cv:
                             if self.users == 0:
                                 break
+                time.sleep(0.5)  # a reply that ended (a snapshot address): no tight reconnect loop
             except Exception:
                 time.sleep(3)

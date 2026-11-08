@@ -22,6 +22,8 @@ def open_lines(path):
         name = next((n for n in z.namelist() if n.startswith("Metadata/plate_") and n.endswith(".gcode")), None)
         if not name:
             raise ValueError("no sliced plate in this 3MF")
+        if z.getinfo(name).file_size > 500 * 1024 * 1024:  # a zip bomb would never finish
+            raise ValueError("the plate in this 3MF unpacks to more than 500 MB")
         return io.TextIOWrapper(z.open(name), encoding="utf-8", errors="ignore"), z.getinfo(name).file_size
     return open(path, encoding="utf-8", errors="ignore"), os.path.getsize(path)
 

@@ -1,22 +1,33 @@
 # C5 Print Hub: phone page for the Flashforge Creator 5 Pro (unofficial). Upload, slice, send, watch, pause/cancel.
 # Run: python -I hub.py   (config.json next to this file; jobs/ holds every upload and slice)
-# First run: open http://127.0.0.1:8765/setup on this PC.
-import bisect, glob, gzip, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, socket, sys, threading, time, \
-    traceback, urllib.request, zipfile
+# First run: setup.ps1 opens the one-time setup link (also in setup-url.txt next to this file) on this PC.
+import bisect, glob, gzip, hashlib, hmac, ipaddress, json, math, os, re, secrets, shutil, socket, ssl, sys, threading, \
+    time, traceback, urllib.request, zipfile
+import socketserver
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import dryer, printer, slicer, toolpath, watcher
+import dryer, printer, security, slicer, toolpath, watcher
 
 CFG_PATH = os.path.join(HERE, "config.json")
 JOBS = os.path.join(HERE, "jobs")
 NAME = "C5 Print Hub"
-# host 0.0.0.0: phones on your own Wi-Fi can open the page (LAN only). Never forward this port on your router.
-# For a hub reachable only through `tailscale serve`, set host to 127.0.0.1 (setup.ps1 -Tailscale).
+# host 0.0.0.0: phones on your own Wi-Fi can open the page. This plain-http port answers home-network addresses only
+# (and Tailscale's, with "tailscale": true); never forward it on your router. Away from home use Tailscale, a
+# Cloudflare Tunnel to remote_tunnel_port, or the HTTPS port (remote_https_port + your own certificate): see README.
 DEFAULTS = {"setup_done": False, "printer_ip": "", "serial": "", "check_code": "", "port": 8765, "host": "0.0.0.0",
+            "tailscale": False, "lan_hosts": [],
+            # Remote access (off until set): both ports need a passphrase (12+ characters) and an authenticator code.
+            "remote_tunnel_port": 0, "remote_https_port": 0, "remote_https_host": "0.0.0.0", "tls_cert": "",
+            "tls_key": "", "remote_hosts": [],
+            # Limits no button overrides (can only be set lower): see slicer.HARD_CAPS.
+            "hard_caps": {},
+            "camera_allow_loopback": False,  # a camera served by this PC itself (the emulator uses this)
+            "http_timeout_s": 20, "http_header_timeout_s": 30, "http_max_conns": 48, "http_max_conns_per_ip": 20,
+            "bed_cleared_at": 0, "bed_cleared_by": "", "last_print_end": 0,
             "colours": ["#FFFFFF", "#1E5BD8", "#F5D000", "#FF69B4"], "leveling": False,
             # Phone webcam (an IP camera app), e.g. "http://192.168.1.50:8080"; "" = printer camera only.
             "webcam_url": "", "webcam_fps": 8,
@@ -25,7 +36,7 @@ DEFAULTS = {"setup_done": False, "printer_ip": "", "serial": "", "check_code": "
             "watch": False, "watch_backend": "", "anthropic_api_key": "", "watch_every_min": 2, "watch_action": "pause",
             "openai_preset": "", "openai_base_url": "", "openai_api_key": "", "openai_model": "", "openai_strong_model": "",
             "openai_timeout_s": 120,
-            "ntfy_topic": "",
+            "ntfy_topic": "", "ntfy_server": "https://ntfy.sh", "ntfy_token": "",
             # Slicer: "flashstudio", or "forkaslicer" (an OrcaSlicer fork in WSL, falls back to Flash Studio if it fails).
             "engine": "flashstudio",
             # Nozzle and bed ranges for the upload check, from common spool labels. Change them to your own spools.
@@ -50,11 +61,16 @@ def load_cfg():
     cfg = dict(DEFAULTS)
     if os.path.exists(CFG_PATH):
         cfg.update(json.load(open(CFG_PATH, encoding="utf-8")))
-    if not cfg.get("password"):
-        cfg["password"] = f"{secrets.randbelow(10**6):06d}"
-    if not cfg.get("secret"):
-        cfg["secret"] = secrets.token_hex(16)
-    json.dump(cfg, open(CFG_PATH, "w", encoding="utf-8"), indent=1)
+    # Older versions kept the PIN in plain text and signed one shared cookie with "secret": hash the PIN and drop
+    # both (every phone logs in once more). A PIN the old version made up before setup is dropped, never kept.
+    if cfg.get("password") and cfg.get("pin_chosen") and not cfg.get("pin_hash"):
+        cfg["pin_hash"] = security.hash_secret(str(cfg["password"]))
+    cfg.pop("password", None)
+    cfg.pop("secret", None)
+    if not cfg.get("api_token"):  # hubctl.py on this PC only (X-Hub-Key from 127.0.0.1), never the PIN
+        cfg["api_token"] = secrets.token_urlsafe(32)
+    json.dump(cfg, open(CFG_PATH + ".tmp", "w", encoding="utf-8"), indent=1)
+    os.replace(CFG_PATH + ".tmp", CFG_PATH)
     return cfg
 
 
@@ -77,8 +93,18 @@ CFG = load_cfg()
 slicer.configure(CFG)
 PR = printer.Printer(CFG["printer_ip"], CFG["serial"], CFG["check_code"])
 CAM = printer.Camera(CFG["printer_ip"] or "0.0.0.0")
-WEBCAM = (printer.Camera(url=webcam_stream(CFG["webcam_url"]), fps=CFG["webcam_fps"], wake=8)
-          if CFG["webcam_url"] else None)
+
+
+def cam_guard(url):
+    """A typed camera address is fetched only on the home network, resolved again at every connect."""
+    return security.pinned(url, bool(CFG.get("camera_allow_loopback")))
+
+
+def phone_camera(url, fps=0):
+    return printer.Camera(url=webcam_stream(url), fps=fps, wake=8, guard=cam_guard)
+
+
+WEBCAM = phone_camera(CFG["webcam_url"], CFG["webcam_fps"]) if CFG["webcam_url"] else None
 STATE = {"detail": None, "error": "starting", "time": 0}
 LAST_CONTROL = {}  # action -> time, so a pause or cancel you sent yourself is not pushed back to you
 STARTED = time.time()
@@ -246,6 +272,10 @@ def poll_status():
                 raise RuntimeError("printer not set up yet: open Setup")
             r = PR.detail()
             if r.get("code") == 0 and r.get("detail"):
+                was = ((STATE["detail"] or {}).get("status") or "").lower()
+                if was in ACTIVE and (r["detail"].get("status") or "").lower() in ("completed", "cancel"):
+                    # the moment the hub first sees a print end: a 'bed cleared' mark from before it no longer counts
+                    save_cfg(last_print_end=time.time())
                 STATE.update(detail=r["detail"], error=None, time=time.time())
                 prev = ETA.layer
                 ETA.update(r["detail"])
@@ -273,8 +303,9 @@ def summary():
     slots = []
     ms = d.get("matlStationInfo") or {}
     for s in ms.get("slotInfos") or []:
-        slots.append({"slot": s.get("slotId"), "material": s.get("materialName"),
-                      "colour": s.get("materialColor"), "loaded": s.get("hasFilament")})
+        # Whatever answers as the printer is not trusted with the page: colours must be #RRGGBB, numbers numbers.
+        slots.append({"slot": num(s.get("slotId")), "material": text(s.get("materialName"), 40),
+                      "colour": colour(s.get("materialColor")), "loaded": s.get("hasFilament") if isinstance(s.get("hasFilament"), bool) else None})
     prog = d.get("printProgress") or 0
     prog = prog * 100 if prog <= 1 else prog
     left, eta_from, where = d.get("estimatedTime"), "printer", None
@@ -288,20 +319,36 @@ def summary():
         sent, level = ETA.sent
         left = round(max(60, START_S[level] - (time.time() - sent)) + ETA.cum[1.0][-1] * ETA.k)
         eta_from = "start"
-    return {"online": True, "status": d.get("status"), "file": d.get("printFileName"),
-            "progress": round(prog, 1), "layer": d.get("printLayer"),
-            "layers": d.get("targetPrintLayer"),
+    return {"online": True, "status": text(d.get("status"), 30), "file": text(d.get("printFileName"), 200),
+            "progress": round(prog, 1), "layer": num(d.get("printLayer")),
+            "layers": num(d.get("targetPrintLayer")),
             # the file's own layer and height at the printer's place in the file (its printLayer bounces)
             "file_layer": where[0] if where else None, "z": where[1] if where else None,
             "z_top": where[2] if where else None, "file_layers": where[3] if where else None, "left_s": left, "eta_from": eta_from,
-            "printer_left_s": d.get("estimatedTime"), "speed": d.get("printSpeedAdjust"), "elapsed_s": d.get("printDuration"),
+            "printer_left_s": num(d.get("estimatedTime")), "speed": num(d.get("printSpeedAdjust")),
+            "elapsed_s": num(d.get("printDuration")),
             "bed": round(float(d.get("platTemp") or 0)), "bed_target": round(float(d.get("platTargetTemp") or 0)),
             "chamber_target": round(float(d.get("chamberTargetTemp") or 0)),
             # chamberTemp -108 means no chamber sensor (ff-5mp-api-py changelog)
             "chamber": round(float(d.get("chamberTemp") or 0)) if float(d.get("chamberTemp") or 0) > -50 else None,
             "tools": tools, "slots": slots,
-            "light": d.get("lightStatus"), "door": d.get("doorStatus"), "error_code": d.get("errorCode"),
-            "thumb": bool(d.get("printFileThumbUrl"))}
+            "light": text(d.get("lightStatus"), 10), "door": text(d.get("doorStatus"), 10),
+            "error_code": text(d.get("errorCode"), 12), "thumb": bool(d.get("printFileThumbUrl"))}
+
+
+def num(v):
+    try:
+        return None if v is None else round(float(v)) if float(v) == int(float(v)) else round(float(v), 2)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def text(v, n):
+    return None if v is None else str(v)[:n]
+
+
+def colour(v):
+    return v if isinstance(v, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", v) else None
 
 
 # ---------- temperature and speed ----------
@@ -460,6 +507,11 @@ def watch_scene(name):
 WATCH = watcher.Watcher(CFG, PR, CAM, summary, log, watch_scene, slicer.colour_name, WEBCAM)
 
 
+def push(msg, priority="high"):
+    """A phone push without holding up the reply (ntfy can take seconds to answer)."""
+    threading.Thread(target=WATCH.notify, args=(msg, priority), daemon=True).start()
+
+
 def dry_judge(img, prompt, view):
     """Drying bed check: Sonnet (not Haiku), since a wrong 'empty' lets a print home the bed into the spools.
     No AI set up: 'unsure', and you unlock by eye on the phone page. The simulator sets dry_judge to a fixed verdict
@@ -524,11 +576,16 @@ def add_file(job, fname, path):
         if job["parts"]:
             raise ValueError("start a new print for a sliced file")
         job.update(kind="sliced", sliced_file=os.path.basename(path), state="ready", stats=slicer.stats(text))
-        trusted = (job["stats"].get("slicer") or "").startswith("Flash Studio")
+        # The "generated by" line is only information: anyone can write it. The hard check runs on every file.
+        named = (job["stats"].get("slicer") or "").startswith("Flash Studio")
+        job["hard"] = slicer.hard_check_file(path, CFG.get("hard_caps"))
         job["sanity"] = slicer.sanity(text, CFG["material_ranges"]) + slicer.preset_check(text, CFG.get("house_presets"))
-        reasons = ([] if trusted else [f"sliced by {job['stats'].get('slicer') or 'an unknown slicer'}, not Flash Studio"])
+        reasons = [hard_reason(r) for r in job["hard"]]
+        reasons += ([] if named else [f"sliced by {job['stats'].get('slicer') or 'an unknown slicer'}, not Flash Studio"])
         reasons += job["sanity"]
         job["check"] = {"passed": not reasons, "reasons": reasons}
+        if job["hard"]:
+            job["state"] = "blocked"
         slicer.preview_png(text, pad_colours(job["stats"]["colours"]), os.path.join(job_dir(job["id"]), "preview.png"))
         job["design"] = {"state": "checking"}
     else:
@@ -536,6 +593,10 @@ def add_file(job, fname, path):
     save_job(job)
     if job.get("design") == {"state": "checking"}:
         threading.Thread(target=design_job, args=(job["id"],), daemon=True).start()
+
+
+def hard_reason(r):
+    return f"NEVER SENT (not even with Send anyway): {r}"
 
 
 def design_job(jid):
@@ -616,8 +677,9 @@ def slice_job(jid):
                 out = f"{safe}.gcode"
                 shutil.copy(r["gcode"], os.path.join(d, out))
                 slicer.preview_png(text, CFG["colours"], os.path.join(d, "preview.png"))
-                reasons = r["reasons"] + slicer.preset_check(text, CFG.get("house_presets"))
-                job.update(state="blocked" if reasons else "ready", sliced_file=out, stats=slicer.stats(text),
+                hard = slicer.hard_check(text, CFG.get("hard_caps"))
+                reasons = [hard_reason(x) for x in hard] + r["reasons"] + slicer.preset_check(text, CFG.get("house_presets"))
+                job.update(state="blocked" if reasons else "ready", sliced_file=out, stats=slicer.stats(text), hard=hard,
                            check={"passed": not reasons, "reasons": reasons}, dims=r["dims"], error=None,
                            engine=r["engine"], engine_note=r["fallback"], fine=r["fine"], design={"state": "checking"})
         except Exception as e:
@@ -636,12 +698,18 @@ def used_tools(job):
 
 def backfill(job):
     """Jobs from before the material and upload checks: add what they lack, once."""
-    if "materials" in job["stats"] and not (job.get("kind") == "sliced" and "sanity" not in job):
+    if "materials" in job["stats"] and "hard" in job and not (job.get("kind") == "sliced" and "sanity" not in job):
         return job
-    text = slicer.read_gcode(os.path.join(job_dir(job["id"]), job["sliced_file"]))
+    path = os.path.join(job_dir(job["id"]), job["sliced_file"])
+    text = slicer.read_gcode(path)
     with JOB_LOCK:
         job = load_job(job["id"])
         job["stats"]["materials"] = slicer.materials(text)
+        if "hard" not in job:  # jobs from before the hard check
+            job["hard"] = slicer.hard_check_file(path, CFG.get("hard_caps"))
+            if job["hard"]:
+                c = job.get("check") or {"reasons": []}
+                job["check"] = {"passed": False, "reasons": [hard_reason(r) for r in job["hard"]] + c.get("reasons", [])}
         if job.get("kind") == "sliced" and "sanity" not in job:
             job["sanity"] = slicer.sanity(text, CFG["material_ranges"])
             if job["sanity"]:
@@ -707,12 +775,32 @@ def shifted_file(job, dz):
     return dst
 
 
-def send_job(jid, leveling, plate_clear, allow_unchecked=False):
+class NeedConfirm(ValueError):
+    """A send that needs one more yes from the phone (409, "confirm": what to ask)."""
+    def __init__(self, msg, what):
+        super().__init__(msg)
+        self.what = what
+
+
+def bed_state(s=None):
+    """The optional 'bed cleared' mark: when it was made, and whether a print has ended since."""
+    s = s or summary()
+    at, end = float(CFG.get("bed_cleared_at") or 0), float(CFG.get("last_print_end") or 0)
+    idle_after_print = (s.get("status") or "").lower() in ("completed", "cancel")
+    return {"cleared_at": at or None, "cleared_by": CFG.get("bed_cleared_by") or None, "last_print_end": end or None,
+            "needs_mark": at <= end if end else (idle_after_print and not at)}
+
+
+def send_job(jid, leveling, plate_clear, allow_unchecked=False, remote=None, no_mark_ok=False):
+    """remote: the device name when the request came in on a remote port (an extra confirm when the bed was not
+    marked cleared since the last print, and a push to the phone)."""
     if DRY.refuse():
         raise ValueError(DRY.refuse())
     job = load_job(jid)
     if job.get("sliced_file") and job.get("stats"):
         job = backfill(job)
+    if job.get("hard"):  # temperature over the hardware cap or a firmware-level command: no override
+        raise ValueError("this file is never sent: " + "; ".join(job["hard"]))
     if job.get("state") not in ("ready", "sent", "done") and not (job.get("state") == "blocked" and allow_unchecked):
         raise ValueError(f"job is {job.get('state')}, not ready")
     if (job.get("design") or {}).get("state") == "checking" and not allow_unchecked:
@@ -727,6 +815,9 @@ def send_job(jid, leveling, plate_clear, allow_unchecked=False):
     problems = material_problems(job, s)
     if problems and not allow_unchecked:
         raise ValueError("; ".join(problems))
+    if remote and bed_state(s)["needs_mark"] and not no_mark_ok:
+        raise NeedConfirm("The bed was not marked cleared since the last print ended. Look at the camera frame: "
+                          "is the bed really clear?", "bed")
     status = (s["status"] or "").lower()
     if status in ("completed", "cancel"):
         PR.clear_platform()
@@ -763,8 +854,11 @@ def send_job(jid, leveling, plate_clear, allow_unchecked=False):
     with JOB_LOCK:
         job = load_job(jid)
         job.update(state="sent", sent=time.strftime("%Y-%m-%d %H:%M"), sent_ts=time.time(), leveling=bool(leveling),
-                   z_offset=dz)
+                   z_offset=dz, sent_from=remote or "home network")
         save_job(job)
+    if remote:
+        push(f"Print started remotely from {remote}: {job['name']}"
+                     + ("" if bed_state(s)["cleared_at"] and not bed_state(s)["needs_mark"] else " (bed not marked cleared)"))
     return job
 
 
@@ -1018,33 +1112,241 @@ def list_jobs():
 
 
 # ---------- http ----------
+# Three kinds of door, decided only by the port a request came in on, never by its address or headers:
+#   lan     the plain-http port (CFG port): home-network and this-PC addresses only, PIN login, 30-day sessions.
+#   remote  remote_tunnel_port (127.0.0.1 only, for cloudflared) and remote_https_port (TLS with your own
+#           certificate): passphrase + authenticator code, 7-day sessions, Secure cookies, a push on every new device.
+# Every door: Host allowlist, JSON or file bodies only, Origin check on every POST, bounded connections and time.
 
-def token():
-    return hmac.new(CFG["secret"].encode(), CFG["password"].encode(), hashlib.sha256).hexdigest()
+SESS = security.Sessions(os.path.join(HERE, "sessions.json"), lambda m: log(m))
+LOGIN_LOCK = threading.Lock()  # one secret check at a time (each costs ~50 ms of scrypt plus a fixed wait)
+UPLOADS = threading.BoundedSemaphore(2)
+INCOMING = os.path.join(JOBS, ".incoming")
+SETUP_TOKEN = secrets.token_urlsafe(24) if not CFG.get("setup_done") else None
+SETUP_URL_FILE = os.path.join(HERE, "setup-url.txt")
+PENDING_TOTP = {}  # session id -> authenticator secret being set up, until its first code is typed
+COOKIE = {"lan": "hub", "remote": "__Host-hub"}
+
+
+def on_lock(kind, n):
+    if kind == "remote":
+        save_cfg(remote_locked=True)
+        msg = f"Remote login LOCKED after {n} wrong tries in an hour. Log in once on your home network to open it again."
+    else:
+        msg = f"Home-network login paused for 15 min after {n} wrong tries in an hour."
+    log("SECURITY " + msg)
+    push(msg)
+
+
+LIMIT = security.Limiter(on_lock, remote_locked=bool(CFG.get("remote_locked")))
+
+
+def remote_ready():
+    return bool(CFG.get("remote_pass_hash") and CFG.get("totp_secret"))
+
+
+def lan_names():
+    h = socket.gethostname().lower()
+    return ({"localhost"} | {h + x for x in ("", ".local", ".lan", ".home", ".home.arpa", ".localdomain", ".internal")}
+            | {str(x).lower().rstrip(".") for x in CFG.get("lan_hosts") or []})
+
+
+def remote_names():
+    return {"localhost"} | {str(x).lower().rstrip(".") for x in CFG.get("remote_hosts") or []}
+
+
+class Refused(Exception):
+    def __init__(self, code, msg, **extra):
+        super().__init__(msg)
+        self.code, self.extra = code, extra
+
+
+class StepUp(Refused):
+    def __init__(self, msg):
+        super().__init__(403, msg, step_up=True, what="passphrase" if CFG.get("remote_pass_hash") else "PIN")
+
+
+class HubServer(ThreadingHTTPServer):
+    """http.server with a connection cap (in all and per address), socket timeouts, a deadline for the request line
+    and headers (slow-loris), and optional TLS. kind: 'lan' or 'remote'."""
+    daemon_threads = True
+    request_queue_size = 64
+    allow_reuse_address = False  # Windows: SO_REUSEADDR would let a second program take over the port
+
+    def __init__(self, addr, kind, tls=None, secure=False, per_ip=True):
+        self.kind, self.tls, self.secure, self.per_ip = kind, tls, secure or bool(tls), per_ip
+        self.cap = threading.BoundedSemaphore(int(CFG.get("http_max_conns") or 48))
+        self.by_ip, self.heads, self.lock = {}, {}, threading.Lock()
+        super().__init__(addr, H)
+
+    def server_bind(self):
+        # http.server looks up the address's full DNS name here, which can take seconds on Windows; not needed
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        if self.tls:  # the handshake runs in the handler thread, under its timeout, not in the accept loop
+            sock = self.tls.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        return sock, addr
+
+    def process_request(self, request, client_address):
+        ip = client_address[0]
+        with self.lock:
+            busy = self.per_ip and self.by_ip.get(ip, 0) >= int(CFG.get("http_max_conns_per_ip") or 20)
+            if not busy and self.cap.acquire(blocking=False):
+                self.by_ip[ip] = self.by_ip.get(ip, 0) + 1
+            else:
+                busy = True
+        if busy:  # full: say so at once and hang up, so nobody waits on a queue that never moves
+            try:
+                if not self.tls:
+                    request.settimeout(2)
+                    request.sendall(b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._done(ip)
+            raise
+
+    def _done(self, ip):
+        with self.lock:
+            self.by_ip[ip] = self.by_ip.get(ip, 1) - 1
+            if self.by_ip[ip] <= 0:
+                self.by_ip.pop(ip, None)
+        self.cap.release()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.heads.pop(request, None)
+            self._done(client_address[0])
+
+    def handle_error(self, request, client_address):
+        e = sys.exc_info()[1]
+        if not isinstance(e, (OSError, ssl.SSLError, ConnectionError)):
+            log(f"http error from {client_address[0]}: {traceback.format_exc()}")
+
+    def reap(self):
+        """Hang up on connections still sending their request line or headers after http_header_timeout_s."""
+        limit = float(CFG.get("http_header_timeout_s") or 30)
+        for sock, t in list(self.heads.items()):
+            if time.time() - t > limit:
+                self.heads.pop(sock, None)
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+SERVERS = []
+
+
+def reaper():
+    while True:
+        time.sleep(1)
+        for s in list(SERVERS):
+            s.reap()
 
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    server_version = "C5PrintHub"
+    sys_version = ""
 
     def log_message(self, *a):
         pass
 
-    def local(self):
-        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+    def setup(self):
+        self.server.heads[self.request] = time.time()  # the TLS handshake counts against the header deadline too
+        self.timeout = float(CFG.get("http_timeout_s") or 20)
+        super().setup()
+        if self.server.tls:
+            self.connection.do_handshake()
 
-    def setup_open(self):
-        """The setup page without a PIN: only before setup is done, and only from this PC."""
-        return not CFG.get("setup_done") and self.local()
+    def handle_one_request(self):
+        self.server.heads.setdefault(self.request, time.time())  # until the headers are in (parse_request)
+        self.session = self.token = None
+        self.cookie_out = []
+        super().handle_one_request()
 
-    def authed(self):
-        if hmac.compare_digest(self.headers.get("X-Hub-Key", ""), CFG["password"]):
-            return True
+    def parse_request(self):
+        ok = super().parse_request()
+        self.server.heads.pop(self.request, None)
+        return ok
+
+    def end_headers(self):
+        # Security headers on every reply. The pages still use inline script, so the CSP allows it but nothing
+        # from anywhere else: no other site can load, frame or receive anything from these pages.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                         "img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; "
+                         "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+        if self.server.secure:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        for c in self.cookie_out:
+            self.send_header("Set-Cookie", c)
+        self.cookie_out = []
+        super().end_headers()
+
+    # ---- who is asking ----
+    def ip(self):
+        return self.client_address[0]
+
+    def cookie(self, name):
         for c in (self.headers.get("Cookie") or "").split(";"):
             k, _, v = c.strip().partition("=")
-            if k == "hub" and hmac.compare_digest(v, token()):
-                return True
-        return False
+            if k == name:
+                return v
+        return None
 
+    def set_session_cookie(self, token, max_age=None):
+        kind = self.server.kind
+        age = security.TTL[kind] if max_age is None else max_age
+        flags = "; Secure" if self.server.secure else ""
+        same = "Lax" if kind == "remote" else "Strict"  # Lax: the first load after a Cloudflare Access sign-in
+        self.cookie_out.append(f"{COOKIE[kind]}={token}; Max-Age={age}; Path=/; HttpOnly; SameSite={same}{flags}")
+
+    def device(self):
+        if self.session == "api":
+            return "this PC (hubctl)"
+        return (self.session or {}).get("device") if isinstance(self.session, dict) else None
+
+    def authed(self):
+        """The session behind this request (a dict), 'api' for hubctl's token from this PC, or None."""
+        if self.session:
+            return self.session
+        key = self.headers.get("X-Hub-Key")
+        if key is not None:  # only on the home port, only from this PC, never through a proxy, never the PIN
+            if (self.server.kind == "lan" and ipaddress.ip_address(security.ip_of(self.ip())).is_loopback
+                    and not security.proxied(self.headers) and CFG.get("api_token")
+                    and hmac.compare_digest(key.encode(), CFG["api_token"].encode())):
+                self.session = "api"
+                return self.session
+            return None
+        tok = self.cookie(COOKIE[self.server.kind])
+        rec = SESS.get(tok, self.server.kind) if tok else None
+        if rec:
+            self.session, self.token = rec, tok
+            if SESS.touch_cookie(tok):
+                self.set_session_cookie(tok)
+        return self.session
+
+    def setup_cookie_ok(self):
+        v = self.cookie("hubsetup")
+        return bool(SETUP_TOKEN and v and hmac.compare_digest(v.encode(), SETUP_TOKEN.encode()))
+
+    # ---- replies ----
     def send(self, code, body, ctype="application/json", extra=None):
         if not isinstance(body, bytes):
             body = (json.dumps(body) if ctype == "application/json" else body).encode()
@@ -1052,10 +1354,18 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def page(self, name, **subs):
+        html = open(os.path.join(HERE, "static", name), encoding="utf-8").read()
+        for k, v in subs.items():
+            html = html.replace("__" + k.upper() + "__", v)
+        return self.send(200, html, "text/html; charset=utf-8")
 
     def send_file(self, path, ctype, cache, gz=None):
         """A file with an ETag (304 when the phone already has it), streamed. gz: "stored" when the file on disk is
@@ -1097,58 +1407,216 @@ class H(BaseHTTPRequestHandler):
         with open(path, "rb") as f:
             shutil.copyfileobj(f, self.wfile, 1 << 20)
 
-    def body(self, limit=300_000_000):
-        n = int(self.headers.get("Content-Length") or 0)
+    # ---- request bodies ----
+    def content_length(self, limit):
+        if self.headers.get("Transfer-Encoding"):
+            raise Refused(411, "send a Content-Length")
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return 0
+        if not re.fullmatch(r"\d{1,12}", raw.strip()):
+            raise Refused(400, "bad Content-Length")
+        n = int(raw)
         if n > limit:
-            raise ValueError("file too large")
-        return self.rfile.read(n)
+            raise Refused(413, "too large")
+        return n
+
+    def json_body(self, limit=100_000):
+        n = self.content_length(limit)
+        data = self.rfile.read(n) if n else b""
+        if len(data) < n:
+            raise ConnectionError("body cut short")
+        self.body_read = True
+        try:
+            req = json.loads(data or b"{}")
+        except ValueError:
+            raise Refused(400, "the body is not JSON")
+        if not isinstance(req, dict):
+            raise Refused(400, "the body must be a JSON object")
+        return req
+
+    def read_to_file(self, path, limit):
+        """Stream an upload to disk in 1 MB pieces (never all of it in memory); refuses a body over limit before
+        reading any of it, and a trickle slower than ~20 KB/s."""
+        n = self.content_length(limit)
+        t0, left = time.time(), n
+        try:
+            with open(path, "wb") as f:
+                while left:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        raise ConnectionError("upload cut short")
+                    f.write(chunk)
+                    left -= len(chunk)
+                    if time.time() - t0 > max(120, n / 20000):
+                        raise Refused(408, "upload too slow")
+        except BaseException:
+            self.close_connection = True
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        self.body_read = True
+        return n
 
     def do_GET(self):
-        try:
-            self.route("GET")
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-        except ValueError as e:  # refusals meant for the user (not ready, plate not confirmed, ...)
-            self.send(400, {"error": str(e)})
-        except Exception as e:
-            log(traceback.format_exc())
-            self.send(400, {"error": str(e)})
+        self.handle_method("GET")
 
     def do_POST(self):
+        self.handle_method("POST")
+
+    def handle_method(self, method):
+        self.body_read = method == "GET"
         try:
-            self.route("POST")
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
+            self.route(method)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError, socket.timeout):
+            self.close_connection = True
+        except Refused as e:
+            if not self.body_read:
+                self.close_connection = True  # the body was not read: this connection cannot carry another request
+            extra = {"Retry-After": str(math.ceil(e.extra["wait_s"]))} if e.extra.get("wait_s") else None
+            self.send(e.code, dict({"error": str(e)}, **e.extra), extra=extra)
+        except NeedConfirm as e:
+            self.send(409, {"error": str(e), "confirm": e.what})
+        except FileNotFoundError:
+            self.send(404, {"error": "not found"})
         except ValueError as e:  # refusals meant for the user (not ready, plate not confirmed, ...)
-            self.send(400, {"error": str(e)})
-        except Exception as e:
-            log(traceback.format_exc())
-            self.send(400, {"error": str(e)})
+            self.send(400, {"error": str(e)[:500]})
+        except Exception:
+            log(traceback.format_exc())  # the detail stays in hub.log; the page gets no paths or internals
+            self.send(500, {"error": "something went wrong in the hub (details in hub.log)"})
+
+    def gate(self, method, p):
+        """Refuse what never reaches a route: the internet on the home port, a proxy pointed at the home port,
+        a Host this hub does not answer to, and a POST that is not this hub's own page (or hubctl)."""
+        kind = self.server.kind
+        if kind == "lan":
+            if not security.home_client(self.ip(), bool(CFG.get("tailscale"))):
+                log(f"SECURITY refused {self.ip()} on the home port (not a home-network address)")
+                raise Refused(403, "this port only answers your home network")
+            if security.proxied(self.headers):
+                raise Refused(403, "this port is for your home network: point a tunnel or proxy at remote_tunnel_port")
+        names = lan_names() if kind == "lan" else remote_names()
+        host = self.headers.get("Host") or ""
+        if not security.host_ok(host, names):
+            raise Refused(421, "unknown host name: open the hub by its address, or add the name to lan_hosts in "
+                          "config.json" if kind == "lan" else
+                          "unknown host name: add your remote address to remote_hosts in config.json")
+        if method == "POST":
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            want = "application/octet-stream" if p in ("/api/upload", "/api/setup/template/upload") else "application/json"
+            if ctype != want:
+                raise Refused(415, f"send {want}")
+            if not security.origin_ok(self.headers, host, remote_names() if kind == "remote" else ()):
+                log(f"SECURITY refused a cross-site POST {p} from {self.ip()} (Origin {self.headers.get('Origin')})")
+                raise Refused(403, "this request did not come from the hub's own page")
+
+    def check_secret(self, given, stored, what):
+        """One login or step-up try: rate limited, a fixed ~0.5 s whatever the outcome."""
+        kind, ip = self.server.kind, self.ip()
+        w = LIMIT.wait(kind, ip)
+        if w == float("inf"):
+            raise Refused(423, "remote login is locked after too many wrong tries. Log in once on your home network "
+                          "to open it again." if kind == "remote" else
+                          "login is paused for 15 minutes after too many wrong tries")
+        if w > 0:
+            raise Refused(429, f"too many tries: wait {math.ceil(w)} s", wait_s=w)
+        if not LOGIN_LOCK.acquire(timeout=3):
+            raise Refused(429, "busy, try again in a moment", wait_s=2)
+        try:
+            t0 = time.time()
+            ok = security.check_secret(str(given or ""), stored)
+            ok = what(ok) if callable(what) else ok
+            time.sleep(max(0.0, 0.5 - (time.time() - t0)))
+        finally:
+            LOGIN_LOCK.release()
+        if ok:
+            LIMIT.success(kind, ip)
+            if kind == "lan" and CFG.get("remote_locked"):
+                save_cfg(remote_locked=False)
+                log("SECURITY remote login open again (owner logged in on the home network)")
+        else:
+            LIMIT.fail(kind, ip)
+            log(f"SECURITY wrong secret from {ip} on the {kind} port")
+        return ok
+
+    def step_up(self, req):
+        """Changes that send secrets or traffic somewhere else (printer, cameras, AI address or key, alerts, PIN,
+        passphrase) need the passphrase again (the PIN on the home port when no passphrase is set). Good for 10 min."""
+        if not CFG.get("setup_done") or self.session in ("api", "setup"):
+            return
+        if self.token and SESS.elevated(self.token):
+            return
+        stored = CFG.get("remote_pass_hash") or (CFG.get("pin_hash") if self.server.kind == "lan" else None)
+        if not req.get("confirm_secret"):
+            raise StepUp("type your passphrase again to change this" if CFG.get("remote_pass_hash")
+                         else "type your PIN again to change this")
+        if not self.check_secret(req.get("confirm_secret"), stored, None):
+            raise StepUp("that was not right")
+        SESS.elevate(self.token, 600)
+
+    def login(self):
+        kind = self.server.kind
+        req = self.json_body(10_000)
+        if not CFG.get("setup_done") or not CFG.get("pin_hash"):
+            raise Refused(409, "finish setup on the hub PC first")
+        if kind == "remote":
+            if not remote_ready():
+                raise Refused(409, "remote login is not set up: set a passphrase and an authenticator on the setup page at home")
+            seen = {}
+
+            def code_ok(pass_ok):  # both checked every time, so the time taken says nothing about which was wrong
+                st = security.totp_check(CFG["totp_secret"], req.get("code"), int(CFG.get("totp_last_step") or 0))
+                seen["step"] = st
+                return pass_ok and st is not None
+            ok = self.check_secret(req.get("passphrase"), CFG["remote_pass_hash"], code_ok)
+            if ok:
+                save_cfg(totp_last_step=seen["step"])  # each code works once
+        else:
+            ok = self.check_secret(str(req.get("password") or "").strip(), CFG["pin_hash"], None)
+        if not ok:
+            raise Refused(403, "wrong passphrase or code" if kind == "remote" else "wrong PIN")
+        dev = security.device_name(self.headers.get("User-Agent"))
+        tok = SESS.create(kind, dev, self.ip())
+        self.set_session_cookie(tok)
+        log(f"login: new {kind} session for {dev} from {self.ip()}")
+        push(f"New sign-in to {NAME}: {dev} ({'remote' if kind == 'remote' else 'home network'}, {self.ip()})",
+                     "high" if kind == "remote" else "default")
+        return self.send(200, {"ok": True})
 
     def route(self, method):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         p = u.path
+        self.gate(method, p)
+        kind = self.server.kind
         if p == "/login" and method == "POST":
-            pw = json.loads(self.body(10000) or b"{}").get("password", "")
-            if hmac.compare_digest(pw.strip(), CFG["password"]):
-                return self.send(200, {"ok": True}, extra={
-                    "Set-Cookie": f"hub={token()}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict"})
-            time.sleep(1)
-            return self.send(403, {"error": "wrong password"})
+            return self.login()
+        if p == "/logout" and method == "POST":
+            self.json_body(1000)
+            if self.authed() and isinstance(self.session, dict):
+                SESS.revoke(token=self.token)
+            self.set_session_cookie("", 0)
+            return self.send(200, {"ok": True})
+        if p == "/setup" and q.get("token") and not CFG.get("setup_done"):
+            # the one-time setup link: swap the token for a cookie and drop it from the address bar
+            if not (SETUP_TOKEN and hmac.compare_digest(q["token"].encode(), SETUP_TOKEN.encode())) or kind != "lan":
+                return self.send(403, NOT_SET_UP, "text/html; charset=utf-8")
+            self.cookie_out.append(f"hubsetup={SETUP_TOKEN}; Path=/; HttpOnly; SameSite=Strict")
+            return self.send(303, b"", "text/plain", extra={"Location": "/setup"})
         if p in ("/", "/index.html", "/setup"):
             if not CFG.get("setup_done"):
-                if self.local():
-                    page = "setup.html"
-                else:
-                    return self.send(200, NOT_SET_UP, "text/html; charset=utf-8")
-            elif not self.authed():
-                page = "login.html"
-            else:
-                page = "setup.html" if p == "/setup" else "index.html"
-            return self.send(200, open(os.path.join(HERE, "static", page), "rb").read(), "text/html; charset=utf-8")
+                if self.setup_cookie_ok():
+                    return self.page("setup.html")
+                return self.send(200, NOT_SET_UP, "text/html; charset=utf-8")
+            if not self.authed():
+                return self.page("login.html", mode=kind)
+            return self.page("setup.html" if p == "/setup" else "index.html")
         if p.startswith("/api/setup"):
-            if not (self.setup_open() or self.authed()):
+            if not CFG.get("setup_done") and self.setup_cookie_ok():
+                self.session = "setup"
+            elif not self.authed():
                 return self.send(401, {"error": "login"})
             return setup_route(self, method, p, q)
         if p == "/manifest.json":
@@ -1158,13 +1626,35 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, open(os.path.join(HERE, "static", "icon.svg"), "rb").read(), "image/svg+xml")
         if not self.authed():
             return self.send(401, {"error": "login"})
+        if kind == "remote" and method == "POST":
+            log(f"remote {self.device()} ({self.ip()}): POST {p}")  # audit trail of everything done from away
+
+        if p == "/api/sessions" and method == "GET":
+            return self.send(200, {"sessions": SESS.listing(self.token), "remote_locked": LIMIT.remote_locked()})
+        if p == "/api/sessions/revoke" and method == "POST":
+            req = self.json_body(1000)
+            n = SESS.revoke(kind=None, keep=self.token) if req.get("all_others") else SESS.revoke(sid=str(req.get("id") or ""))
+            log(f"sessions: {n} revoked by {self.device()}")
+            return self.send(200, {"revoked": n, "sessions": SESS.listing(self.token)})
+        if p == "/api/bed_cleared" and method == "POST":
+            self.json_body(1000)
+            save_cfg(bed_cleared_at=time.time(), bed_cleared_by=self.device() or "?")
+            log(f"bed marked cleared by {self.device()}")
+            return self.send(200, bed_state())
+        if p == "/api/snapshot" and method == "GET":  # a fresh frame and when it was taken, for the send sheet
+            cam = WEBCAM if q.get("cam") == "webcam" and WEBCAM else CAM
+            f = cam.snapshot(cam.wake)
+            if not f:
+                return self.send(503, {"error": "camera not answering"})
+            return self.send(200, f, "image/jpeg", extra={"X-Frame-Time": f"{time.time():.0f}"})
 
         if p == "/api/status":
             return self.send(200, {"printer": summary(), "slicing": SLICE_LOCK.locked(), "watch": WATCH.state,
                                    "colours": CFG["colours"], "leveling": CFG["leveling"], "hold": hold_state(),
-                                   "webcam": bool(WEBCAM), "drying": DRY.public(), "watch_ready": bool(watcher.backend(CFG))})
+                                   "webcam": bool(WEBCAM), "drying": DRY.public(), "watch_ready": bool(watcher.backend(CFG)),
+                                   "bed": bed_state(), "remote": kind == "remote", "device": self.device()})
         if p == "/api/watch" and method == "POST":
-            req = json.loads(self.body(10000) or b"{}")
+            req = self.json_body(10000)
             if "enabled" in req:
                 WATCH.set_enabled(req["enabled"])
                 save_cfg(watch=bool(req["enabled"]))
@@ -1177,7 +1667,7 @@ class H(BaseHTTPRequestHandler):
                 if os.path.exists(os.path.join(d, m.group(1))):
                     return self.send(200, open(os.path.join(d, m.group(1)), "rb").read(), "image/jpeg")
         if p == "/api/drying" and method == "POST":
-            req = json.loads(self.body(10000) or b"{}")
+            req = self.json_body(10000)
             a = req.get("action")
             if a == "start":
                 r = DRY.start(req.get("preset"), req.get("bed"), req.get("chamber"), req.get("hours"), req.get("confirm"))
@@ -1206,8 +1696,10 @@ class H(BaseHTTPRequestHandler):
                 return self.send(404, {"error": f"This print was not sent from {NAME}, so its file is not here."
                                        if s.get("file") else "Nothing printing."})
             return self.send(200, job_settings(job))
-        if p == "/api/raw":
-            return self.send(200, {"detail": STATE["detail"], "error": STATE["error"]})
+        if p == "/api/raw":  # the printer's own status, less its cloud registration codes and network ids
+            d = {k: v for k, v in (STATE["detail"] or {}).items()
+                 if k not in ("flashRegisterCode", "polarRegisterCode", "macAddr", "ipAddr", "cameraStreamUrl")}
+            return self.send(200, {"detail": d or None, "error": STATE["error"]})
         if p in ("/cam.jpg", "/webcam.jpg") or p in ("/cam.mjpg", "/webcam.mjpg"):
             cam = WEBCAM if p.startswith("/webcam") else CAM
             if not cam:
@@ -1239,17 +1731,26 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/jobs" and method == "GET":
             return self.send(200, list_jobs())
         if p == "/api/upload" and method == "POST":
-            fname = os.path.basename(q.get("name", "upload.stl")).replace("..", "")
-            with JOB_LOCK:
-                job = load_job(q["job"]) if q.get("job") else new_job(
-                    q.get("title") or os.path.splitext(fname)[0], q.get("source", "phone"))
-            data = self.body()
-            stored = f"{len(os.listdir(job_dir(job['id']))):02d}-{re.sub(r'[^A-Za-z0-9._-]+', '_', fname)}"
-            open(os.path.join(job_dir(job["id"]), stored), "wb").write(data)
+            fname = os.path.basename(q.get("name", "upload.stl")).replace("..", "")[:120]
+            if q.get("job"):
+                load_job(q["job"])  # a real job, before any of the body is read
+            if not UPLOADS.acquire(timeout=1):
+                raise Refused(503, "another upload is running, try again in a moment", wait_s=5)
+            try:
+                os.makedirs(INCOMING, exist_ok=True)
+                tmp = os.path.join(INCOMING, secrets.token_hex(8))
+                n = self.read_to_file(tmp, 300_000_000)  # streamed to disk; the job folder only once it all came in
+                with JOB_LOCK:
+                    job = load_job(q["job"]) if q.get("job") else new_job(
+                        (q.get("title") or os.path.splitext(fname)[0])[:60], q.get("source", "phone")[:20])
+                stored = f"{len(os.listdir(job_dir(job['id']))):02d}-{re.sub(r'[^A-Za-z0-9._-]+', '_', fname)}"
+                os.replace(tmp, os.path.join(job_dir(job["id"]), stored))
+            finally:
+                UPLOADS.release()
             with JOB_LOCK:
                 job = load_job(job["id"])
                 add_file(job, fname, os.path.join(job_dir(job["id"]), stored))
-            log(f"upload {job['id']} {fname} {len(data)} bytes from {q.get('source', 'phone')}")
+            log(f"upload {job['id']} {fname} {n} bytes from {q.get('source', 'phone')[:20]}")
             return self.send(200, job)
         m = re.fullmatch(r"/api/jobs/([0-9a-f-]+)(?:/(\w+(?:\.\w+)?))?", p)
         if m:
@@ -1284,12 +1785,13 @@ class H(BaseHTTPRequestHandler):
             if method == "GET" and act == "precheck":  # what the send sheet must show before Start print
                 job = backfill(load_job(jid))
                 s = summary()
-                return self.send(200, {"check": job.get("check"),
+                return self.send(200, {"check": job.get("check"), "hard": job.get("hard") or [],
+                                       "bed": bed_state(s) if s["online"] else None, "remote": kind == "remote",
                                        "problems": material_problems(job, s) if s["online"] else [],
                                        "notes": (colour_notes(job, s) if s["online"] else [])
                                                 + [n for n in [z_offset(job)[1]] if n]})
             if method == "POST" and act == "update":
-                req = json.loads(self.body(100000))
+                req = self.json_body(100000)
                 with JOB_LOCK:
                     job = load_job(jid)
                     if job["state"] == "slicing":
@@ -1308,6 +1810,7 @@ class H(BaseHTTPRequestHandler):
                     save_job(job)
                 return self.send(200, job)
             if method == "POST" and act == "slice":
+                self.json_body(1000)
                 job = load_job(jid)
                 if job.get("kind") != "model" or not job["parts"]:
                     raise ValueError("nothing to slice")
@@ -1315,27 +1818,34 @@ class H(BaseHTTPRequestHandler):
                 job["state"] = "queued"
                 return self.send(200, job)
             if method == "POST" and act == "print":
-                req = json.loads(self.body(10000) or b"{}")
+                req = self.json_body(10000)
                 job = send_job(jid, bool(req.get("leveling", CFG["leveling"])), bool(req.get("plate_clear")),
-                               bool(req.get("allow_unchecked")))
+                               bool(req.get("allow_unchecked")), self.device() if kind == "remote" else None,
+                               bool(req.get("no_mark_ok")))
                 return self.send(200, job)
             if method == "POST" and act == "delete":
+                self.json_body(1000)
                 shutil.rmtree(d, ignore_errors=True)
                 return self.send(200, {"ok": True})
         if p == "/api/adjust" and method == "POST":
-            req = json.loads(self.body(10000) or b"{}")
+            req = self.json_body(10000)
             return self.send(200, adjust(str(req.get("item", "")), req.get("value")))
         if p == "/api/control" and method == "POST":
-            a = json.loads(self.body(10000)).get("action")
+            a = self.json_body(10000).get("action")
             fn = {"pause": lambda: PR.job("pause"), "resume": lambda: PR.job("continue"),
                   "cancel": lambda: PR.job("cancel"), "light_on": lambda: PR.light(True),
                   "light_off": lambda: PR.light(False), "clear_plate": PR.clear_platform}.get(a)
             if not fn:
                 raise ValueError("unknown action")
+            file = summary().get("file")
             r = fn()
             LAST_CONTROL[a] = time.time()
-            log(f"control {a}: {r}")
+            log(f"control {a}: {r}" + (f" (remote, {self.device()})" if kind == "remote" else ""))
+            if kind == "remote" and a == "cancel" and PR.ok(r):
+                push(f"Print cancelled remotely from {self.device()}: {file}")
             return self.send(200 if PR.ok(r) else 409, {"ok": PR.ok(r), "reply": r})
+        if method == "POST" and not self.body_read:
+            self.close_connection = True
         return self.send(404, {"error": "not found"})
 
     def stream(self, cam):
@@ -1367,13 +1877,15 @@ class H(BaseHTTPRequestHandler):
 
 # ---------- first-run setup ----------
 # The setup page (static/setup.html) walks through: find the printer, serial + check code, PIN, cameras, your own
-# Flash Studio export as the slicing template, and the optional watcher. Before setup is done it opens without a PIN,
-# from this PC only; after that it sits behind the PIN like every other page.
+# Flash Studio export as the slicing template, the optional watcher, alerts and remote access. Before setup is done
+# it opens only with the one-time setup link (setup-url.txt) on this PC, and the hub listens on this PC only; after
+# that it sits behind the PIN like every other page, and changes that move secrets or traffic need it again.
 
 NOT_SET_UP = (f"<!doctype html><meta name=viewport content='width=device-width'><title>{NAME}</title>"
               "<body style='font-family:sans-serif;background:#14161a;color:#eee;padding:16px'>"
-              f"<h2>{NAME} is not set up yet</h2><p>Finish setup on the PC that runs the hub: open "
-              "<b>http://127.0.0.1:%d/setup</b> in a browser there.</p>" % CFG["port"])
+              f"<h2>{NAME} is not set up yet</h2><p>Finish setup on the PC that runs the hub, with the one-time "
+              "setup link: <b>setup.ps1</b> opens it for you, and it is also in <b>setup-url.txt</b> in the hub's "
+              "folder. Open it in a browser on that PC.</p>")
 SCAN = {"running": False, "found": [], "done": 0, "total": 0}
 FS_SLICES = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Temp", "orca-flashforge", "slice")
 
@@ -1387,8 +1899,7 @@ def apply_printer():
 def apply_webcam():
     """A changed phone camera address takes effect at once, for the page, the watcher and the drying check."""
     global WEBCAM
-    WEBCAM = (printer.Camera(url=webcam_stream(CFG["webcam_url"]), fps=CFG["webcam_fps"], wake=8)
-              if CFG["webcam_url"] else None)
+    WEBCAM = phone_camera(CFG["webcam_url"], CFG["webcam_fps"]) if CFG["webcam_url"] else None
     WATCH.cams = ([("phone", WEBCAM, 8)] if WEBCAM else []) + [("printer", CAM, 20)]
     DRY.cams = list(WATCH.cams)
 
@@ -1446,23 +1957,23 @@ def scan(nets):
 
 
 def private_url(url):
-    """Camera addresses must be http on this network: the setup page never fetches the internet for you."""
-    u = urlparse(url or "")
-    if u.scheme != "http" or not u.hostname:
-        raise ValueError("camera address must start with http:// and the phone's address")
-    try:
-        a = ipaddress.ip_address(socket.gethostbyname(u.hostname))
-    except (OSError, ValueError):
-        raise ValueError(f"cannot find {u.hostname} on this network")
-    if not (a.is_private or a.is_loopback):
-        raise ValueError("camera address must be on your own network")
+    """A phone camera address: http, on the home network (resolved and checked; this PC only with
+    camera_allow_loopback). The setup page never fetches the internet, loopback or 169.254 for you."""
+    security.pinned(url, bool(CFG.get("camera_allow_loopback")))
     return url
+
+
+def short_path(path):
+    """A path for the setup page with the user's own folder shown as ~ (no user name on the page)."""
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path and path.lower().startswith(home.lower()) else path
 
 
 def template_info(path):
     with zipfile.ZipFile(path) as z:
-        cfg = json.loads(z.read("Metadata/project_settings.config"))
-        head = z.read("Metadata/plate_1.gcode")[:400].decode(errors="ignore")
+        slicer.zip_sizes_ok(z)
+        cfg = json.loads(slicer.zip_entry(z, "Metadata/project_settings.config", 50 * 2 ** 20))
+        head = slicer.zip_head(z, "Metadata/plate_1.gcode", 400).decode(errors="ignore")
     gen = re.search(r"generated by (.+)", head)
     return {"file": os.path.basename(path), "time": time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path))),
             "printer": cfg.get("printer_settings_id"), "process": cfg.get("print_settings_id"),
@@ -1470,22 +1981,25 @@ def template_info(path):
             "problems": slicer.check_template(path)}
 
 
-def setup_state():
+def setup_state(h=None):
     s = summary()
     tpl = None
     if slicer.template_ready():
         try:
             tpl = template_info(slicer.TEMPLATE)
         except Exception as e:
-            tpl = {"problems": [str(e)]}
+            tpl = {"problems": [str(e)[:200]]}
     key, okey = CFG.get("anthropic_api_key") or "", CFG.get("openai_api_key") or ""
+    running = {srv.kind + ("_https" if srv.tls else "") for srv in SERVERS}
     return {"name": NAME, "setup_done": bool(CFG.get("setup_done")), "local": True,
+            "door": h.server.kind if h else "lan",
+            "step_up": "passphrase" if CFG.get("remote_pass_hash") else "PIN",
             "printer": {"ip": CFG["printer_ip"], "serial_set": bool(CFG["serial"]), "check_set": bool(CFG["check_code"]),
                         "online": s["online"], "status": s.get("status"), "error": s.get("error")},
             "pin_set": bool(CFG.get("pin_chosen")), "port": CFG["port"], "host": CFG["host"],
             "lan_urls": [f"http://{ip}:{CFG['port']}" for ip in pc_ips()],
             "webcam_url": CFG["webcam_url"],
-            "flash_studio": {"path": slicer.FLASH_STUDIO, "found": os.path.isfile(slicer.FLASH_STUDIO)},
+            "flash_studio": {"path": short_path(slicer.FLASH_STUDIO), "found": os.path.isfile(slicer.FLASH_STUDIO)},
             "template": tpl, "fs_slices": os.path.isdir(FS_SLICES),
             "watcher": {"backend": watcher.backend(CFG), "chosen": CFG.get("watch_backend") or "",
                         "key_end": key[-4:] if key else "", "enabled": WATCH.state["enabled"],
@@ -1493,13 +2007,36 @@ def setup_state():
                                    "model": CFG.get("openai_model") or "", "strong_model": CFG.get("openai_strong_model") or "",
                                    "key_end": okey[-4:] if okey else ""},
                         "claude_cli": bool(shutil.which("claude") or os.path.exists(WATCH.claude or ""))},
+            "ntfy": {"server": CFG.get("ntfy_server") or "https://ntfy.sh", "topic": CFG.get("ntfy_topic") or "",
+                     "token_set": bool(CFG.get("ntfy_token"))},
+            "remote": {"pass_set": bool(CFG.get("remote_pass_hash")), "totp_set": bool(CFG.get("totp_secret")),
+                       "tunnel_port": CFG.get("remote_tunnel_port") or 0, "https_port": CFG.get("remote_https_port") or 0,
+                       "tunnel_on": "remote" in running, "https_on": "remote_https" in running,
+                       "hosts": CFG.get("remote_hosts") or [], "locked": LIMIT.remote_locked(),
+                       "tailscale": bool(CFG.get("tailscale"))},
             "scan": SCAN}
 
 
+def local_ai(url):
+    """True for an AI server address on this PC or the home network (Ollama, LM Studio)."""
+    host = urlparse(url).hostname or ""
+    try:
+        return all(security.home_client(i[4][0]) for i in socket.getaddrinfo(host, None)) and bool(host)
+    except OSError:
+        return False
+
+
+def ntfy_url_ok(url):
+    u = urlparse(url)
+    if u.scheme == "https" and u.hostname:
+        return True
+    return u.scheme == "http" and bool(u.hostname) and local_ai(url)
+
+
 def setup_route(h, method, p, q):
-    req = json.loads(h.body(20000) or b"{}") if method == "POST" and p != "/api/setup/template/upload" else {}
+    req = h.json_body(20000) if method == "POST" and p != "/api/setup/template/upload" else {}
     if p == "/api/setup" and method == "GET":
-        return h.send(200, setup_state())
+        return h.send(200, setup_state(h))
     if p == "/api/setup/scan" and method == "POST":
         nets = [req["network"]] if req.get("network") else local_networks()
         for n in nets:
@@ -1510,20 +2047,23 @@ def setup_route(h, method, p, q):
             SCAN["running"] = True
         return h.send(200, {"networks": nets, **SCAN})
     if p == "/api/setup/printer" and method == "POST":
+        h.step_up(req)
         ip = (req.get("ip") or "").strip()
         try:
-            ipaddress.ip_address(ip)
+            a = ipaddress.ip_address(ip)
         except ValueError:
             raise ValueError("printer address looks like 192.168.1.50")
-        serial, check = (req.get("serial") or "").strip(), (req.get("check_code") or "").strip()
+        if not (a.is_private or a.is_loopback) or a.is_multicast or a.is_unspecified:
+            raise ValueError("the printer must be on your own network (an address like 192.168.1.50)")
+        serial, check = (req.get("serial") or "").strip()[:64], (req.get("check_code") or "").strip()[:64]
         if not serial or not check:
             raise ValueError("type the serial number and the check code from the printer screen")
         try:
             r = printer.Printer(ip, serial, check).detail()
         except Exception as e:
-            raise ValueError(f"no answer from {ip}:8898 ({e}). Is the printer on and on this network?")
+            raise ValueError(f"no answer from {ip}:8898 ({type(e).__name__}). Is the printer on and on this network?")
         if r.get("code") != 0:
-            msg = r.get("message") or str(r)
+            msg = str(r.get("message") or "")[:80] or "no"
             hint = (" Turn on LAN Only mode on the printer screen first." if "lan" in msg.lower() else
                     " Check the serial number and check code against the printer screen.")
             raise ValueError(f"the printer said: {msg}.{hint}")
@@ -1531,27 +2071,32 @@ def setup_route(h, method, p, q):
         apply_printer()
         d = r.get("detail") or {}
         log(f"setup: printer {ip} answers, status {d.get('status')}")
-        return h.send(200, {"ok": True, "status": d.get("status"), "name": d.get("name")})
+        return h.send(200, {"ok": True, "status": text(d.get("status"), 30), "name": text(d.get("name"), 60)})
     if p == "/api/setup/pin" and method == "POST":
+        h.step_up(req)
         pin = str(req.get("pin") or "").strip()
         if not re.fullmatch(r"\d{4,8}", pin):
             raise ValueError("PIN must be 4 to 8 digits")
-        save_cfg(password=pin, pin_chosen=True, secret=secrets.token_hex(16))  # new secret: old logins end
-        log("setup: PIN changed")
-        return h.send(200, {"ok": True}, extra={
-            "Set-Cookie": f"hub={token()}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict"})
+        save_cfg(pin_hash=security.hash_secret(pin), pin_chosen=True)
+        n = SESS.revoke(kind="lan", keep=h.token)  # every other home-network login ends
+        if h.server.kind == "lan" and not isinstance(h.session, dict):
+            h.set_session_cookie(SESS.create("lan", security.device_name(h.headers.get("User-Agent")), h.ip()))
+        log(f"setup: PIN changed, {n} other home-network logins ended")
+        return h.send(200, {"ok": True})
     if p == "/api/setup/camera.jpg" and method == "GET":  # live preview for the camera step
         if q.get("which") == "printer":
             cam = CAM
         else:
-            cam = printer.Camera(url=webcam_stream(private_url(q.get("url"))), wake=8)
+            cam = phone_camera(private_url(q.get("url")))
         f = cam.snapshot(cam.wake if q.get("which") != "printer" else 20)
         return h.send(200, f, "image/jpeg") if f else h.send(503, {"error": "camera not answering"})
     if p == "/api/setup/camera" and method == "POST":
         url = (req.get("url") or "").strip()
         if url:
+            if url != CFG.get("webcam_url"):
+                h.step_up(req)
             private_url(url)
-            f = printer.Camera(url=webcam_stream(url), wake=8).snapshot(8)
+            f = phone_camera(url).snapshot(8)
             if not f:
                 raise ValueError(f"no picture from {webcam_stream(url)} in 8 s. Is the camera app running, with the "
                                  "phone on the same Wi-Fi as this PC? Check the address the app shows.")
@@ -1566,8 +2111,8 @@ def setup_route(h, method, p, q):
             try:
                 out.append(template_info(f))
             except Exception as e:
-                out.append({"file": os.path.basename(f), "problems": [f"unreadable: {e}"]})
-        return h.send(200, {"folder": FS_SLICES, "files": out})
+                out.append({"file": os.path.basename(f), "problems": [f"unreadable: {str(e)[:100]}"]})
+        return h.send(200, {"folder": short_path(FS_SLICES), "files": out})
     if p in ("/api/setup/template/use", "/api/setup/template/upload") and method == "POST":
         if p.endswith("/use"):
             name = os.path.basename(req.get("file") or "")
@@ -1578,11 +2123,14 @@ def setup_route(h, method, p, q):
         else:
             src = os.path.join(HERE, "template", "upload.3mf.part")
             os.makedirs(os.path.dirname(src), exist_ok=True)
-            open(src, "wb").write(h.body(200_000_000))
+            h.read_to_file(src, 200_000_000)
             presets = q.get("only_these_presets") == "1"
         problems = slicer.check_template(src)
         if problems:
             raise ValueError("this file cannot be the template: " + "; ".join(problems))
+        hard = slicer.hard_check_file(src, CFG.get("hard_caps"))
+        if hard:
+            raise ValueError("this file cannot be the template: " + "; ".join(hard))
         dst = slicer.TEMPLATE
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst):  # keep the one it replaces
@@ -1601,35 +2149,56 @@ def setup_route(h, method, p, q):
         if b not in ("", "api", "cli", "openai"):
             raise ValueError("unknown watcher choice")
         ch = {"watch_backend": b}
+        redirects = b != (CFG.get("watch_backend") or "") and b in ("api", "openai")
+        note = None
         if b == "openai":
             url = (req.get("base_url") or "").strip()
-            if urlparse(url).scheme not in ("http", "https") or not urlparse(url).hostname:
+            u = urlparse(url)
+            if u.scheme not in ("http", "https") or not u.hostname:
                 raise ValueError("type the server address, like https://api.openai.com/v1")
+            if u.hostname.startswith("169.254.") or u.hostname in ("metadata.google.internal",):
+                raise ValueError("that address is not an AI server")
+            if u.scheme == "http":
+                if not local_ai(url):
+                    raise ValueError("an AI server on the internet must use https:// (the key would travel in clear text)")
+                if not req.get("local_server"):
+                    raise ValueError("plain http:// is only for your own server on this PC or network: tick "
+                                     "'my own local server' to confirm")
             model = (req.get("model") or "").strip()
             if not model:
                 raise ValueError("type the model name (one that can read images)")
-            ch.update(openai_preset=str(req.get("preset") or "")[:20], openai_base_url=url, openai_model=model,
-                      openai_strong_model=(req.get("strong_model") or "").strip())
-            if (req.get("openai_key") or "").strip():
-                ch["openai_api_key"] = req["openai_key"].strip()
-            if req.get("forget_openai_key"):
-                ch["openai_api_key"] = ""
+            new_key = (req.get("openai_key") or "").strip()
+            old = urlparse(CFG.get("openai_base_url") or "")
+            moved = (u.scheme, u.hostname, u.port) != (old.scheme, old.hostname, old.port)
+            redirects = redirects or moved or bool(new_key)
+            ch.update(openai_preset=str(req.get("preset") or "")[:20], openai_base_url=url, openai_model=model[:100],
+                      openai_strong_model=(req.get("strong_model") or "").strip()[:100])
+            if new_key:
+                ch["openai_api_key"] = new_key
+            elif moved and CFG.get("openai_api_key"):
+                ch["openai_api_key"] = ""  # a saved key never follows the address to another server
+                note = "the saved key was for another server, so it was cleared: type the key for this one"
         if b == "api":
             key = (req.get("api_key") or "").strip()
             if key and not key.startswith("sk-ant-"):
                 raise ValueError("an Anthropic API key starts with sk-ant-")
             if key:
                 ch["anthropic_api_key"] = key
+                redirects = True
             elif not CFG.get("anthropic_api_key"):
                 raise ValueError("paste your Anthropic API key")
-        if req.get("forget_key"):
+        if req.get("forget_key"):  # forgetting works whatever is chosen
             ch["anthropic_api_key"] = ""
+        if req.get("forget_openai_key"):
+            ch["openai_api_key"] = ""
+        if redirects:
+            h.step_up(req)
         save_cfg(**ch)
         on = bool(req.get("enabled")) and bool(watcher.backend(CFG))
         WATCH.state["enabled"] = on
         save_cfg(watch=on)
         log(f"setup: watcher backend '{watcher.backend(CFG)}', {'on' if on else 'off'}")
-        return h.send(200, setup_state()["watcher"])
+        return h.send(200, dict(setup_state(h)["watcher"], note=note))
     if p == "/api/setup/watcher/test" and method == "POST":  # one real check on a printer camera frame
         if not watcher.backend(CFG):
             raise ValueError("choose an AI for the watcher first and save")
@@ -1639,15 +2208,136 @@ def setup_route(h, method, p, q):
         img = os.path.join(WATCH.dir, "setup-test.jpg")
         open(img, "wb").write(f)
         v = WATCH.ask(img, "Print context: setup test, the plate may be empty.", CFG.get("watch_model", "haiku"), "printer")
-        return h.send(200, v)
+        return h.send(200, {k: v.get(k) for k in ("verdict", "part", "reason", "cost", "no_images") if k in v})
+    if p == "/api/setup/ntfy" and method == "POST":
+        if req.get("test"):
+            if not CFG.get("ntfy_topic"):
+                raise ValueError("save a topic first")
+            WATCH.notify(f"Test alert from {NAME}", "default")
+            return h.send(200, setup_state(h)["ntfy"])
+        h.step_up(req)
+        server = (req.get("server") or "https://ntfy.sh").strip().rstrip("/")
+        if not ntfy_url_ok(server):
+            raise ValueError("the ntfy server must be https:// (or http:// on your own network)")
+        topic = secrets.token_urlsafe(18) if req.get("new_topic") else (req.get("topic") or "").strip()
+        if topic and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", topic):
+            raise ValueError("a topic is letters, digits, - and _ only")
+        if topic and len(topic) < 16 and "ntfy.sh" in server:
+            raise ValueError("on the public ntfy.sh server the topic is the only secret: use 16 or more characters "
+                             "(tap Make a private topic)")
+        ch = {"ntfy_server": server, "ntfy_topic": topic}
+        if (req.get("token") or "").strip():
+            ch["ntfy_token"] = req["token"].strip()
+        if req.get("forget_token"):
+            ch["ntfy_token"] = ""
+        save_cfg(**ch)
+        log(f"setup: alerts {'on' if topic else 'off'} ({urlparse(server).hostname})")
+        return h.send(200, setup_state(h)["ntfy"])
+    if p == "/api/setup/remote/totp" and method == "POST":  # a new authenticator secret, saved once a code matches
+        h.step_up(req)
+        sec = security.totp_new_secret()
+        PENDING_TOTP[(h.session or {}).get("id") if isinstance(h.session, dict) else "x"] = sec
+        return h.send(200, {"secret": sec, "uri": security.otpauth_uri(sec, "owner")})
+    if p == "/api/setup/remote" and method == "POST":
+        h.step_up(req)
+        ch, what = {}, []
+        pw = req.get("passphrase")
+        if pw is not None and pw != "":
+            pw = str(pw)
+            if len(pw) < 12:
+                raise ValueError("the passphrase needs 12 or more characters (a few words works well)")
+            if pw != str(req.get("passphrase2") or ""):
+                raise ValueError("the two passphrases do not match")
+            ch["remote_pass_hash"] = security.hash_secret(pw)
+            what.append("passphrase")
+        if req.get("code"):
+            sid = (h.session or {}).get("id") if isinstance(h.session, dict) else "x"
+            sec = PENDING_TOTP.get(sid)
+            st = security.totp_check(sec, req["code"]) if sec else None
+            if st is None:
+                raise ValueError("that code does not match: check the phone's clock and type the newest code")
+            ch.update(totp_secret=sec, totp_last_step=st)
+            PENDING_TOTP.pop(sid, None)
+            what.append("authenticator")
+        if not ch:
+            raise ValueError("nothing to change")
+        save_cfg(**ch)
+        n = SESS.revoke(kind="remote")  # new secrets: every remote login ends
+        log(f"setup: remote {' and '.join(what)} set, {n} remote logins ended")
+        push(f"{NAME}: remote login {' and '.join(what)} changed", "default")
+        return h.send(200, setup_state(h)["remote"])
+    if p == "/api/setup/remote/unlock" and method == "POST":
+        if h.server.kind != "lan":
+            raise ValueError("unlock remote login from your home network")
+        LIMIT.unlock("remote")
+        save_cfg(remote_locked=False)
+        log(f"SECURITY remote login unlocked by {h.device()}")
+        return h.send(200, setup_state(h)["remote"])
     if p == "/api/setup/done" and method == "POST":
         if not CFG.get("pin_chosen"):
             raise ValueError("choose your PIN first")
+        first = not CFG.get("setup_done")
         save_cfg(setup_done=True)
         log("setup: done")
-        return h.send(200, {"ok": True}, extra={
-            "Set-Cookie": f"hub={token()}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict"})
+        if first:
+            finish_setup()
+        return h.send(200, {"ok": True})
     return h.send(404, {"error": "not found"})
+
+
+# ---------- listeners ----------
+
+def finish_setup():
+    """Setup done: the one-time link stops working, the home port opens to the network (it listened on this PC
+    only until now) and the remote ports start."""
+    global SETUP_TOKEN
+    SETUP_TOKEN = None
+    try:
+        os.remove(SETUP_URL_FILE)
+    except OSError:
+        pass
+    if CFG["host"] not in ("127.0.0.1", "localhost") and SERVERS:
+        threading.Timer(1.0, lambda: [s.shutdown() for s in SERVERS if s.kind == "lan"]).start()
+    start_remote()
+
+
+def tls_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(CFG["tls_cert"], CFG.get("tls_key") or None)
+    return ctx
+
+
+def serve(srv):
+    SERVERS.append(srv)
+    try:
+        srv.serve_forever()
+    finally:
+        if srv in SERVERS:
+            SERVERS.remove(srv)
+        srv.server_close()
+
+
+def start_remote():
+    if not CFG.get("setup_done"):
+        return
+    if CFG.get("remote_tunnel_port") and not any(s.kind == "remote" and not s.tls for s in SERVERS):
+        try:  # for cloudflared on this PC: loopback only, the browser sees https through Cloudflare
+            srv = HubServer(("127.0.0.1", int(CFG["remote_tunnel_port"])), "remote", secure=True, per_ip=False)
+            threading.Thread(target=serve, args=(srv,), daemon=True).start()
+            log(f"remote tunnel port 127.0.0.1:{CFG['remote_tunnel_port']} (passphrase + code)")
+        except OSError as e:
+            log(f"remote tunnel port {CFG['remote_tunnel_port']} not started: {e}")
+    if CFG.get("remote_https_port") and not any(s.tls for s in SERVERS):
+        try:
+            srv = HubServer((CFG.get("remote_https_host") or "0.0.0.0", int(CFG["remote_https_port"])), "remote",
+                            tls=tls_context())
+            threading.Thread(target=serve, args=(srv,), daemon=True).start()
+            log(f"remote HTTPS port {CFG['remote_https_port']} (passphrase + code)")
+        except (OSError, ssl.SSLError, KeyError) as e:
+            log(f"remote HTTPS port {CFG.get('remote_https_port')} not started (certificate tls_cert / tls_key?): {e}")
+    if (CFG.get("remote_tunnel_port") or CFG.get("remote_https_port")) and not remote_ready():
+        log("remote ports are open but remote login is not set up yet (setup page: Remote access)")
 
 
 if __name__ == "__main__":
@@ -1655,8 +2345,22 @@ if __name__ == "__main__":
     threading.Thread(target=WATCH.run, daemon=True).start()
     threading.Thread(target=push_events, daemon=True).start()
     threading.Thread(target=DRY.run, daemon=True).start()
-    srv = ThreadingHTTPServer((CFG["host"], CFG["port"]), H)
-    srv.daemon_threads = True
-    log(f"{NAME} on port {CFG['port']}, printer {CFG['printer_ip'] or 'not set up'}"
-        + ("" if CFG.get("setup_done") else f" - finish setup at http://127.0.0.1:{CFG['port']}/setup"))
-    srv.serve_forever()
+    threading.Thread(target=reaper, daemon=True).start()
+    if SETUP_TOKEN:
+        url = f"http://127.0.0.1:{CFG['port']}/setup?token={SETUP_TOKEN}"
+        open(SETUP_URL_FILE, "w", encoding="utf-8").write(url + "\n")
+    start_remote()
+    while True:
+        # Until setup is done the home port listens on this PC only, so nobody else can reach the setup page.
+        host = CFG["host"] if CFG.get("setup_done") else "127.0.0.1"
+        try:
+            srv = HubServer((host, CFG["port"]), "lan")
+        except OSError as e:
+            log(f"port {CFG['port']} busy ({e}), trying again in 5 s")
+            time.sleep(5)
+            continue
+        log(f"{NAME} on {host}:{CFG['port']}, printer {CFG['printer_ip'] or 'not set up'}"
+            + ("" if CFG.get("setup_done") else f" - finish setup with the link in {SETUP_URL_FILE}"))
+        serve(srv)
+        if not CFG.get("setup_done"):
+            break

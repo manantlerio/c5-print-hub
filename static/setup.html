@@ -34,6 +34,9 @@ label.check input { width:22px; height:22px; flex:none; }
 code { background:#0006; padding:1px 5px; border-radius:5px; overflow-wrap:anywhere; }
 .card, .dim { overflow-wrap:anywhere; }
 .warnbox { border-left:4px solid var(--warn); padding:8px 12px; background:#3d321533; border-radius:6px; margin-top:8px; }
+.modal { position:fixed; inset:0; background:#000a; display:none; align-items:center; justify-content:center; z-index:9; padding:16px; }
+.modal.open { display:flex; } .modal .card { width:100%; max-width:420px; }
+.dev { display:flex; gap:8px; align-items:center; border-top:1px solid var(--line); padding:8px 0; }
 </style>
 </head>
 <body>
@@ -119,6 +122,7 @@ code { background:#0006; padding:1px 5px; border-radius:5px; overflow-wrap:anywh
       <option value="ollama">Ollama (local)</option><option value="lmstudio">LM Studio (local)</option><option value="custom">Other</option>
     </select>
     <label class="f">Server address (base URL)</label><input type="text" id="oa-url" placeholder="https://.../v1">
+    <label class="check"><input type="checkbox" id="oa-local"> My own local server on this PC or home network (allows plain http://)</label>
     <label class="f">API key</label><input type="password" id="oa-key" autocomplete="off" placeholder="blank for a local server">
     <div class="dim" id="oa-key-line"></div>
     <label class="check"><input type="checkbox" id="oa-forget"> Forget the saved key</label>
@@ -137,23 +141,90 @@ code { background:#0006; padding:1px 5px; border-radius:5px; overflow-wrap:anywh
   <div class="dim">With the phone on the same Wi-Fi, open:</div>
   <div id="urls" style="font-size:18px;font-weight:600;margin:6px 0"></div>
   <div class="dim">Windows asks once whether to allow Python on networks: choose <b>Private networks</b> only.</div>
-  <div class="warnbox">Keep it on your own network. Never forward this port on your router or put the hub on the open internet: anyone who reaches it can heat and move your printer. For outside access use Tailscale (see the README).</div>
+  <div class="warnbox">This address is for your home network only. Never forward this port on your router: it is plain http, and the hub refuses internet addresses on it anyway. For access away from home see Remote access below and the README (Tailscale, Cloudflare Tunnel, or the HTTPS port).</div>
   <button class="go" style="margin-top:10px" onclick="finish()">Done - open the hub</button>
   <div class="msg" id="done-msg"></div>
 </div>
 
+<div class="card" id="c-ntfy">
+  <h2>Phone alerts (optional)</h2>
+  <div class="dim">Pushes through <a href="https://ntfy.sh" style="color:var(--accent)">ntfy</a>: print done, paused, errors, new sign-ins, remote starts and cancels. Install the ntfy app and subscribe to the topic shown here. On the public ntfy.sh server the topic is the only secret, so let the hub make a long random one. Your own ntfy server and an access token also work.</div>
+  <label class="f">Server</label><input type="text" id="nt-server" placeholder="https://ntfy.sh">
+  <label class="f">Topic</label><input type="text" id="nt-topic" autocomplete="off">
+  <label class="f">Access token (optional)</label><input type="password" id="nt-token" autocomplete="off" placeholder="tk_...">
+  <div class="dim" id="nt-token-line"></div>
+  <label class="check"><input type="checkbox" id="nt-forget"> Forget the saved token</label>
+  <button onclick="ntSave(true)">Make a private topic</button>
+  <button class="primary" onclick="ntSave(false)">Save</button>
+  <button onclick="ntTest()">Send a test alert</button>
+  <div class="msg" id="nt-msg"></div>
+</div>
+
+<div class="card" id="c-remote">
+  <h2>Remote access (optional)</h2>
+  <div class="dim">Away from home the hub asks for a passphrase and a 6-digit code from an authenticator app (Google Authenticator, Microsoft Authenticator, 2FAS, Aegis...). Set both here at home, then pick one way in from the README: Tailscale, a Cloudflare Tunnel, or the HTTPS port with your own certificate.</div>
+  <div id="rm-state" style="margin-top:8px"></div>
+  <label class="f">New passphrase (12 or more characters, a few words works well)</label><input type="password" id="rm-pass" autocomplete="new-password">
+  <label class="f">Same passphrase again</label><input type="password" id="rm-pass2" autocomplete="new-password">
+  <button class="primary" onclick="rmPass()">Save passphrase</button>
+  <h2 style="margin-top:14px">Authenticator</h2>
+  <button onclick="rmTotp()">Set up an authenticator</button>
+  <div id="rm-totp" style="display:none;margin-top:8px">
+    <div class="dim">In the authenticator app add an account by setup key (or open the link on the phone), then type the 6-digit code it shows.</div>
+    <div style="margin-top:6px">Setup key: <code id="rm-secret"></code></div>
+    <div style="margin-top:6px"><a id="rm-uri" style="color:var(--accent);overflow-wrap:anywhere">Open in an authenticator app</a></div>
+    <input type="text" id="rm-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" autocomplete="one-time-code">
+    <button class="primary" onclick="rmCode()">Check code and save</button>
+  </div>
+  <button id="rm-unlock" style="display:none" onclick="rmUnlock()">Open remote login again</button>
+  <div class="msg" id="rm-msg"></div>
+</div>
+
+<div class="card" id="c-devices">
+  <h2>Signed-in devices</h2>
+  <div class="dim">Every phone or browser that logged in. Sign one out if you lost it or do not know it.</div>
+  <div id="dev-list"></div>
+  <button onclick="devRevoke(null, true)">Sign out every other device</button>
+  <button onclick="logout()">Sign out this one</button>
+  <div class="msg" id="dev-msg"></div>
+</div>
+
+<div class="modal" id="su"><div class="card">
+  <h2 id="su-title">Type it again</h2>
+  <div class="dim" id="su-text"></div>
+  <input type="password" id="su-secret" autocomplete="current-password">
+  <button class="primary" id="su-ok">OK</button><button id="su-cancel">Cancel</button>
+</div></div>
+
 <script>
 const $ = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let ST = {};
 async function api(path, opts={}){
   const r = await fetch(path, opts);
   if (r.status === 401) { location.href = "/"; throw new Error("login"); }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (!r.ok) { const e = new Error(j.error || r.statusText); e.stepUp = !!j.step_up; e.what = j.what; throw e; }
   return j;
 }
-const post = (p, b) => api(p, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(b || {})});
+// Changes that send secrets or traffic somewhere else ask for the passphrase (or the PIN) again; then 10 min free.
+function askSecret(text, what){
+  return new Promise(done => {
+    $("su-title").textContent = "Type your " + (what || "PIN") + " again"; $("su-text").textContent = text;
+    $("su-secret").value = ""; $("su").classList.add("open"); $("su-secret").focus();
+    const end = v => { $("su").classList.remove("open"); $("su-ok").onclick = $("su-cancel").onclick = null; done(v); };
+    $("su-ok").onclick = () => end($("su-secret").value); $("su-cancel").onclick = () => end(null);
+  });
+}
+async function post(p, b){
+  try { return await api(p, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(b || {})}); }
+  catch (e) {
+    if (!e.stepUp) throw e;
+    const s = await askSecret(e.message, e.what);
+    if (!s) throw new Error("not changed");
+    return post(p, Object.assign({}, b, {confirm_secret: s}));
+  }
+}
 const say = (id, text, cls) => { $(id).innerHTML = text ? `<span class="${cls || ""}">${esc(text)}</span>` : ""; };
 const done = (id, yes) => $(id).classList.toggle("done", !!yes);
 
@@ -188,7 +259,59 @@ async function load(){
   done("watcher", true);
   $("urls").innerHTML = (ST.lan_urls || []).map(u => esc(u)).join("<br>") || "this PC's address, port " + ST.port;
   done("c-done", ST.setup_done);
+  const n = ST.ntfy || {};
+  if (!$("nt-server")._set) { $("nt-server")._set = 1; $("nt-server").value = n.server || "https://ntfy.sh"; $("nt-topic").value = n.topic || ""; }
+  $("nt-token-line").textContent = n.token_set ? "Token saved. Leave the box empty to keep it." : "";
+  const R = ST.remote || {};
+  $("rm-state").innerHTML = [`Passphrase: ${R.pass_set ? '<span class="ok">set</span>' : '<span class="warn">not set</span>'}`,
+    `Authenticator: ${R.totp_set ? '<span class="ok">set</span>' : '<span class="warn">not set</span>'}`,
+    `Cloudflare Tunnel port: ${R.tunnel_port ? esc(R.tunnel_port) + (R.tunnel_on ? ' <span class="ok">listening on 127.0.0.1</span>' : ' <span class="bad">not running</span>') : "off"}`,
+    `HTTPS port: ${R.https_port ? esc(R.https_port) + (R.https_on ? ' <span class="ok">listening</span>' : ' <span class="bad">not running (certificate?)</span>') : "off"}`,
+    `Remote names: ${esc((R.hosts || []).join(", ") || "none set (remote_hosts)")}`,
+    `Tailscale on the home port: ${R.tailscale ? "on" : "off"}`].map(x => `<div class="dim">${x}</div>`).join("")
+    + (R.locked ? `<div class="bad">Remote login is locked after too many wrong tries.</div>` : "");
+  $("rm-unlock").style.display = R.locked && ST.door === "lan" ? "" : "none";
+  done("c-remote", R.pass_set && R.totp_set);
+  if (ST.setup_done) loadDevices(); else $("c-devices").style.display = "none";
 }
+async function ntSave(fresh){
+  try { const r = await post("/api/setup/ntfy", {server:$("nt-server").value.trim(), topic:$("nt-topic").value.trim(), new_topic:fresh,
+      token:$("nt-token").value, forget_token:$("nt-forget").checked});
+    $("nt-topic").value = r.topic; $("nt-token").value = ""; $("nt-forget").checked = false;
+    say("nt-msg", r.topic ? "Saved. Subscribe to this topic in the ntfy app: " + r.topic : "Alerts off", "ok"); load(); }
+  catch (e) { say("nt-msg", e.message, "bad"); }
+}
+async function ntTest(){ try { await post("/api/setup/ntfy", {test:true}); say("nt-msg", "Test alert sent", "ok"); } catch (e) { say("nt-msg", e.message, "bad"); } }
+async function rmPass(){
+  try { await post("/api/setup/remote", {passphrase:$("rm-pass").value, passphrase2:$("rm-pass2").value});
+    $("rm-pass").value = $("rm-pass2").value = ""; say("rm-msg", "Passphrase saved. Every remote login has to sign in again.", "ok"); load(); }
+  catch (e) { say("rm-msg", e.message, "bad"); }
+}
+async function rmTotp(){
+  try { const r = await post("/api/setup/remote/totp", {}); $("rm-secret").textContent = r.secret; $("rm-uri").href = r.uri;
+    $("rm-totp").style.display = ""; say("rm-msg", ""); }
+  catch (e) { say("rm-msg", e.message, "bad"); }
+}
+async function rmCode(){
+  try { await post("/api/setup/remote", {code:$("rm-code").value.trim()}); $("rm-totp").style.display = "none"; $("rm-code").value = "";
+    say("rm-msg", "Authenticator saved", "ok"); load(); }
+  catch (e) { say("rm-msg", e.message, "bad"); }
+}
+async function rmUnlock(){ try { await post("/api/setup/remote/unlock", {}); say("rm-msg", "Remote login open again", "ok"); load(); } catch (e) { say("rm-msg", e.message, "bad"); } }
+async function loadDevices(){
+  try { const r = await api("/api/sessions");
+    $("dev-list").innerHTML = r.sessions.map(d => `<div class="dev"><div style="flex:1"><b>${esc(d.device)}</b>${d.current ? ' <span class="ok">this one</span>' : ""}
+      <div class="dim">${d.kind === "remote" ? "remote" : "home network"} - ${esc(d.ip)} - last seen ${esc(new Date(d.seen * 1000).toLocaleString())}</div></div>
+      ${d.current ? "" : `<button data-sid="${esc(d.id)}">Sign out</button>`}</div>`).join("") || `<div class="dim">none</div>`;
+  } catch (e) { say("dev-msg", e.message, "bad"); }
+}
+$("dev-list").addEventListener("click", ev => { const b = ev.target.closest("button[data-sid]"); if (b) devRevoke(b.dataset.sid, false); });
+async function devRevoke(id, all){
+  if (all && !confirm("Sign out every other phone and browser?")) return;
+  try { const r = await post("/api/sessions/revoke", all ? {all_others:true} : {id}); say("dev-msg", `${r.revoked} signed out`, "ok"); loadDevices(); }
+  catch (e) { say("dev-msg", e.message, "bad"); }
+}
+async function logout(){ await post("/logout", {}); location.href = "/"; }
 function wbShow(){ const v = (document.querySelector("input[name=wb]:checked") || {}).value;
   $("wb-key").style.display = v === "api" ? "" : "none"; $("wb-openai").style.display = v === "openai" ? "" : "none"; }
 // Base URLs from each provider's own docs (checked 2026-11-07). Model names are examples only: type any model of
@@ -202,7 +325,7 @@ const OA = {
   custom: {url: "", model: "", note: "Any server with an OpenAI-style /chat/completions that takes images."}};
 function oaPreset(fill = true){
   const p = OA[$("oa-preset").value] || OA.custom;
-  if (fill) { $("oa-url").value = p.url; $("oa-model").value = p.model; $("oa-strong").value = ""; }
+  if (fill) { $("oa-url").value = p.url; $("oa-model").value = p.model; $("oa-strong").value = ""; $("oa-local").checked = /^http:/.test(p.url); }
   $("oa-model").placeholder = p.model ? "example: " + p.model : "model name";
   $("oa-hint").textContent = (p.model ? `Model names are examples: ${p.note} ` : p.note + " ") + "Use any model that can read images.";
 }
@@ -215,7 +338,7 @@ async function findPrinter(){
     say("find-msg", s.found.length ? ` found ${s.found.length}` : " nothing answered on port 8898. Is LAN Only on? Type the address from the printer screen instead.", s.found.length ? "ok" : "warn");
     $("found").innerHTML = s.found.map(f => `<div class="found"><img src="/api/setup/camera.jpg?url=${encodeURIComponent("http://" + f.ip + ":8080/?action=stream")}" alt="">
       <div style="flex:1"><b>${esc(f.ip)}</b> ${esc(f.name)}<div class="dim">${esc(f.reply)}</div></div>
-      <button onclick="$('ip').value='${esc(f.ip)}'">Use</button></div>`).join("");
+      <button data-ip="${esc(f.ip)}">Use</button></div>`).join("");
   } catch (e) { say("find-msg", " " + e.message, "bad"); }
   $("b-find").disabled = false;
 }
@@ -255,8 +378,11 @@ function tplRow(f){
   return `<div class="found"><div style="flex:1"><b>${esc(f.printer || f.file)}</b> <span class="dim">${esc(f.time || "")}</span>
     <div class="dim">${esc((f.filaments || []).join(" / "))} - ${esc(f.process || "")}</div>
     ${bad ? `<div class="bad">${esc(f.problems.join("; "))}</div>` : ""}</div>
-    ${bad ? "" : `<button class="primary" onclick="tplUse('${esc(f.file)}')">Use this</button>`}</div>`;
+    ${bad ? "" : `<button class="primary" data-file="${esc(f.file)}">Use this</button>`}</div>`;
 }
+// Names from the printer and from files go in data- attributes, never inside inline script.
+$("found").addEventListener("click", ev => { const b = ev.target.closest("button[data-ip]"); if (b) $("ip").value = b.dataset.ip; });
+$("tpl-list").addEventListener("click", ev => { const b = ev.target.closest("button[data-file]"); if (b) tplUse(b.dataset.file); });
 async function tplLatest(){
   say("tpl-msg", "Looking...");
   try { const r = await api("/api/setup/template/latest");
@@ -271,7 +397,7 @@ async function tplUse(file){
 }
 async function tplUpload(f){
   if (!f) return; say("tpl-msg", "Uploading...");
-  try { const r = await api("/api/setup/template/upload?only_these_presets=" + ($("tpl-presets").checked ? 1 : 0), {method:"POST", body:f});
+  try { const r = await api("/api/setup/template/upload?only_these_presets=" + ($("tpl-presets").checked ? 1 : 0), {method:"POST", headers:{"Content-Type":"application/octet-stream"}, body:f});
     say("tpl-msg", "Template saved: " + (r.filaments || []).join(" / "), "ok"); load(); }
   catch (e) { say("tpl-msg", e.message, "bad"); }
   $("tpl-file").value = "";
@@ -280,9 +406,9 @@ async function saveWatcher(){
   const b = (document.querySelector("input[name=wb]:checked") || {}).value || "";
   try { const r = await post("/api/setup/watcher", {backend:b, api_key:$("apikey").value, forget_key:$("forget").checked, enabled:$("w-on").checked,
       preset:$("oa-preset").value, base_url:$("oa-url").value, openai_key:$("oa-key").value, forget_openai_key:$("oa-forget").checked,
-      model:$("oa-model").value, strong_model:$("oa-strong").value});
+      model:$("oa-model").value, strong_model:$("oa-strong").value, local_server:$("oa-local").checked});
     $("apikey").value = ""; $("forget").checked = false; $("oa-key").value = ""; $("oa-forget").checked = false;
-    say("w-msg", r.backend ? `Saved - watcher ${r.enabled ? "on" : "off"}` : "Watcher off", "ok"); load(); }
+    say("w-msg", (r.backend ? `Saved - watcher ${r.enabled ? "on" : "off"}` : "Watcher off") + (r.note ? ". Note: " + r.note : ""), r.note ? "warn" : "ok"); load(); }
   catch (e) { say("w-msg", e.message, "bad"); }
 }
 async function testWatcher(){
@@ -294,7 +420,7 @@ async function testWatcher(){
   catch (e) { say("w-msg", e.message, "bad"); }
 }
 async function finish(){
-  try { await post("/api/setup/done", {}); location.href = "/"; }
+  try { await post("/api/setup/done", {}); say("done-msg", "Opening the hub...", "ok"); setTimeout(() => location.href = "/", 2000); }
   catch (e) { say("done-msg", e.message, "bad"); }
 }
 load().catch(e => say("printer-msg", e.message, "bad"));

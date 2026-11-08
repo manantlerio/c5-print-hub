@@ -145,6 +145,8 @@ pre { white-space:pre-wrap; font-size:12px; color:var(--dim); max-height:60vh; o
     <h3 style="margin:0 0 6px" id="sh-title">Send to printer</h3>
     <div class="dim" id="sh-info"></div>
     <div id="sh-slots" style="margin:10px 0"></div>
+    <div id="sh-cam-box"><img id="sh-cam" class="preview" style="max-height:32vh" alt="camera now"><div class="dim" id="sh-cam-time"></div></div>
+    <div class="row" id="sh-bed-row"><span class="grow dim" id="sh-bed"></span><button class="link" onclick="markBed()">Mark bed cleared</button></div>
     <label class="check"><input type="checkbox" id="sh-clear"> Plate is clear</label>
     <label class="check"><input type="checkbox" id="sh-level" onchange="sheetJob && sheetInfo()"> Level the bed first</label>
     <label class="check" id="sh-unchecked-row" style="display:none"><input type="checkbox" id="sh-unchecked"> <span id="sh-unchecked-text"></span></label>
@@ -164,6 +166,7 @@ pre { white-space:pre-wrap; font-size:12px; color:var(--dim); max-height:60vh; o
   <div class="card">
     <h3 style="margin:0 0 6px">Dry filament</h3>
     <div class="dim">The hub holds the bed and chamber heat and locks printing until a camera check (or you, by eye) shows the bed is empty again. It never moves the printer.</div>
+    <img id="dry-cam" class="preview" style="max-height:28vh;margin-top:8px" alt="camera now"><div class="dim" id="dry-cam-time"></div>
     <div class="presets" id="dry-presets"></div>
     <div class="adj"><span class="lab"><b>Bed</b></span><input id="dry-bed-t" type="number" inputmode="numeric"><span class="dim">°</span></div>
     <div class="adj"><span class="lab"><b>Chamber</b></span><input id="dry-ch-t" type="number" inputmode="numeric"><span class="dim">°</span></div>
@@ -190,17 +193,19 @@ pre { white-space:pre-wrap; font-size:12px; color:var(--dim); max-height:60vh; o
 let S = {printer:{online:false}}, colours = ["#FFFFFF","#1E5BD8","#F5D000","#FF69B4"], lightOn = false, camOn = true, paused = false, sheetJob = null, jobsCache = [];
 const openParts = new Set();
 const $ = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function toast(msg, ms=3500){ const t=$("toast"); t.textContent=msg; t.style.display="block"; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none", ms); }
 async function api(path, opts={}){
   const r = await fetch(path, opts); if (r.status===401) { location.reload(); throw new Error("login"); }
-  const j = await r.json().catch(()=>({})); if (!r.ok) throw new Error(j.error || (j.reply && JSON.stringify(j.reply)) || r.statusText); return j;
+  const j = await r.json().catch(()=>({})); if (!r.ok) { const e = new Error(j.error || (j.reply && JSON.stringify(j.reply)) || r.statusText); e.data = j; throw e; } return j;
 }
 const post = (path, body) => api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body||{})});
 const hms = s => { s=+s||0; const h=Math.floor(s/3600), m=Math.round(s%3600/60); return h ? `${h}h ${m}m` : `${m}m`; };
 const shortTime = t => String(t||"").replace(/(\d+h \d+m) \d+s/, "$1");
-function slotColours(){ const sl = S.printer.slots||[]; return [1,2,3,4].map(i => (sl.find(x=>x.slot==i)||{}).colour || colours[i-1]); }
-const sw = c => `<span class="swatch" style="background:${c}"></span>`;
+// Colours reach a style attribute, so only #RRGGBB ever goes in (the hub checks them too).
+const col = c => /^#[0-9A-Fa-f]{6}$/.test(c || "") ? c : "#808080";
+function slotColours(){ const sl = S.printer.slots||[]; return [1,2,3,4].map(i => col((sl.find(x=>x.slot==i)||{}).colour || colours[i-1])); }
+const sw = c => `<span class="swatch" style="background:${col(c)}"></span>`;
 
 async function refresh(){
   const hadWebcam = !!S.webcam;
@@ -314,7 +319,7 @@ async function upload(files){
   for (const f of files){
     toast(`Uploading ${f.name}...`, 60000);
     try {
-      const job = await api(`/api/upload?name=${encodeURIComponent(f.name)}${jid?"&job="+jid:""}`, {method:"POST", body:f});
+      const job = await api(`/api/upload?name=${encodeURIComponent(f.name)}${jid?"&job="+jid:""}`, {method:"POST", headers:{"Content-Type":"application/octet-stream"}, body:f});
       if (job.kind === "model"){ jid = job.id; openParts.add(jid); }
     } catch(e){ toast(`${f.name}: ${e.message}`, 8000); }
   }
@@ -331,7 +336,7 @@ function jobCard(j){
     : model ? `${j.parts.length} part${j.parts.length===1?"":"s"}` : "";
   let h = `<div class="card job"><div class="row top">` +
     (hasPrev ? `<img class="thumb" src="/api/jobs/${j.id}/preview.png?${j.state}" alt="" onclick="show3d('${j.id}')">` : "") +
-    `<div class="grow"><div class="row"><b class="grow ell">${esc(j.name)}</b><span class="pill ${statePill[j.state]||""}">${stateText[j.state]||j.state}</span></div>
+    `<div class="grow"><div class="row"><b class="grow ell">${esc(j.name)}</b><span class="pill ${statePill[j.state]||""}">${esc(stateText[j.state]||j.state)}</span></div>
      <div style="margin-top:4px">${info}</div>
      <div class="dim">${esc(j.created)}${j.source==="claude"?" - from Claude":""}${j.engine==="forkaslicer"?" - ForkaSlicer":""}</div></div></div>`;
   if (j.engine_note) h += `<div class="reasons">${esc(j.engine_note)}</div>`;
@@ -346,7 +351,7 @@ function jobCard(j){
     h += `<details ${open?"open":""} ontoggle="this.open ? openParts.add('${j.id}') : openParts.delete('${j.id}')"><summary>Colours and layer height</summary>`;
     for (const [i, p] of j.parts.entries())
       h += `<div class="part row"><span class="grow ell">${esc(p.name)}</span><div class="tools">` +
-        [1,2,3,4].map(t => `<button class="tool ${p.tool==t?"on":""}" style="background:${sc[t-1]}" onclick="setTool('${j.id}',${i},${t})">${t}</button>`).join("") + `</div></div>`;
+        [1,2,3,4].map(t => `<button class="tool ${p.tool==t?"on":""}" style="background:${col(sc[t-1])}" onclick="setTool('${j.id}',${i},${t})">${t}</button>`).join("") + `</div></div>`;
     h += `<div class="row part"><span class="grow">Layer height</span><select onchange="setLayer('${j.id}',this.value)">` +
       ["0.12","0.16","0.2","0.24"].map(l => `<option ${String(j.layer)===l?"selected":""} value="${l}">${l} mm${l==="0.2"?" (standard)":""}</option>`).join("") +
       `</select></div><label class="check part"><input type="checkbox" ${j.detail?"checked":""} onchange="setDetail('${j.id}',this.checked)"> Detail - finer layers only where slopes and curves would show steps</label>` +
@@ -380,7 +385,7 @@ function detailText(f){
 }
 async function setDetail(id,on){ try { await post(`/api/jobs/${id}/update`, {detail:on}); loadJobs(); } catch(e){ toast(e.message); } }
 async function setLayer(id,l){ try { await post(`/api/jobs/${id}/update`, {layer:l}); loadJobs(); } catch(e){ toast(e.message); } }
-async function addParts(id, files){ for (const f of files){ try { await api(`/api/upload?job=${id}&name=${encodeURIComponent(f.name)}`, {method:"POST", body:f}); } catch(e){ toast(e.message, 6000); } } loadJobs(); }
+async function addParts(id, files){ for (const f of files){ try { await api(`/api/upload?job=${id}&name=${encodeURIComponent(f.name)}`, {method:"POST", headers:{"Content-Type":"application/octet-stream"}, body:f}); } catch(e){ toast(e.message, 6000); } } loadJobs(); }
 async function sliceJob(id){ try { await post(`/api/jobs/${id}/slice`); toast("Slicing"); loadJobs(); } catch(e){ toast(e.message, 6000); } }
 async function delJob(id){ if (!confirm("Delete this print from the list?")) return; await post(`/api/jobs/${id}/delete`); loadJobs(); }
 async function showText(id, f){ const r = await fetch(`/api/jobs/${id}/${f}`); const t = await r.text(); openSheetRaw("Check details", `<pre>${esc(t)}</pre>`); }
@@ -443,7 +448,25 @@ $("cam").addEventListener("wheel", e => { if (!camFs) return; e.preventDefault()
 addEventListener("keydown", e => { if (e.key === "Escape" && camFs) camFull(false); });
 
 function openSheetRaw(title, html){ $("sh-title").textContent = title; $("sh-info").innerHTML = html; $("sh-slots").innerHTML = "";
-  for (const id of ["sh-clear","sh-level","sh-go"]) $(id).closest("label,button").style.display = "none"; $("sh-unchecked-row").style.display="none"; $("sheet").classList.add("open"); }
+  for (const id of ["sh-clear","sh-level","sh-go"]) $(id).closest("label,button").style.display = "none";
+  $("sh-cam-box").style.display = $("sh-bed-row").style.display = "none"; $("sh-unchecked-row").style.display="none"; $("sheet").classList.add("open"); }
+// A fresh camera frame with the time it was taken, next to Start print and Start drying (most useful from away).
+let shotUrls = {};
+async function freshShot(img, line){
+  $(line).textContent = "Getting a fresh camera frame..."; $(img).removeAttribute("src");
+  try { const r = await fetch("/api/snapshot?cam=" + (useWebcam() ? "webcam" : "printer"), {cache:"no-store"});
+    if (!r.ok) throw new Error("camera not answering");
+    const t = new Date(+r.headers.get("X-Frame-Time") * 1000), b = await r.blob();
+    if (shotUrls[img]) URL.revokeObjectURL(shotUrls[img]); shotUrls[img] = URL.createObjectURL(b); $(img).src = shotUrls[img];
+    $(line).textContent = `Camera frame taken ${t.toLocaleTimeString()}`;
+  } catch(e){ $(line).textContent = "No fresh camera frame: " + e.message + ". Look at the live camera before you start."; }
+}
+function showBed(B){
+  B = B || {}; const at = B.cleared_at ? new Date(B.cleared_at * 1000).toLocaleString() : "";
+  $("sh-bed").innerHTML = B.needs_mark ? `<b style="color:#f5cf6b">Bed not marked cleared since the last print ended</b>`
+    : at ? `Bed marked cleared ${esc(at)}${B.cleared_by ? " by " + esc(B.cleared_by) : ""}` : "Bed cleared mark (optional): none yet";
+}
+async function markBed(){ try { const B = await post("/api/bed_cleared", {}); S.bed = B; showBed(B); toast("Bed marked cleared"); } catch(e){ toast(e.message, 6000); } }
 // Print time from the hub's model of the file plus the start (heating, and probing if leveling), so "done" is real.
 // What the printer was really given: the settings block inside the file this print was sent with.
 async function openSettings(){
@@ -471,6 +494,7 @@ function openSheet(id){
   if (D.phase === "drying" || D.phase === "bedcheck") return toast(D.phase === "drying" ? "Drying mode is on - stop it and check the bed first" : "Check the bed first (drying just finished)", 6000);
   const j = jobsCache.find(x=>x.id===id); sheetJob = j; const st = j.stats||{}, sc = slotColours(), p = S.printer;
   for (const id of ["sh-clear","sh-level","sh-go"]) $(id).closest("label,button").style.display = "";
+  $("sh-cam-box").style.display = ""; $("sh-bed-row").style.display = "flex"; showBed(S.bed); freshShot("sh-cam", "sh-cam-time");
   $("sh-title").textContent = "Print " + j.name;
   sheetInfo();
   $("sh-slots").innerHTML = (st.colours||[]).map(([i,c]) => { const s=(p.slots||[]).find(x=>x.slot==i)||{};
@@ -479,6 +503,9 @@ function openSheet(id){
   showUnchecked(!(j.check||{}).passed ? (j.check||{}).reasons||[] : [], []);
   $("sheet").classList.add("open");
   api(`/api/jobs/${id}/precheck`).then(r => { if (sheetJob && sheetJob.id === id) { showUnchecked(r.check && !r.check.passed ? r.check.reasons||[] : [], r.problems||[]);
+    if (r.bed) showBed(r.bed);
+    if ((r.hard||[]).length) { $("sh-unchecked-row").style.display = "none"; $("sh-go").disabled = true;
+      $("sh-slots").innerHTML += `<div class="reasons">Never sent: ${esc(r.hard.join("; "))}</div>`; } else $("sh-go").disabled = false;
     if ((r.notes||[]).length) $("sh-slots").innerHTML += `<div style="color:#f5cf6b;padding:4px 0">${esc(r.notes.join("; "))}</div>`; } }).catch(()=>{});
 }
 function showUnchecked(reasons, problems){
@@ -487,12 +514,16 @@ function showUnchecked(reasons, problems){
   $("sh-unchecked-text").innerHTML = show ? (problems.length ? `<b style="color:#ff9b9e">${esc(problems.join("; "))}</b><br>` : "") + `Send anyway (${esc(all.join("; "))})` : "";
 }
 function closeSheet(){ $("sheet").classList.remove("open"); }
-async function sendJob(){
+async function sendJob(noMarkOk){
   if (!$("sh-clear").checked) return toast("Tick 'Plate is clear' first");
   $("sh-go").disabled = true; toast("Sending to printer...", 60000);
-  try { await post(`/api/jobs/${sheetJob.id}/print`, {plate_clear:true, leveling:$("sh-level").checked, allow_unchecked:$("sh-unchecked").checked});
+  try { await post(`/api/jobs/${sheetJob.id}/print`, {plate_clear:true, leveling:$("sh-level").checked, allow_unchecked:$("sh-unchecked").checked, no_mark_ok:!!noMarkOk});
     toast("Print started"); closeSheet(); loadJobs(); setTimeout(refresh, 2000);
-  } catch(e){ toast("Not sent: " + e.message, 10000); }
+  } catch(e){
+    $("sh-go").disabled = false;
+    // From away with no 'bed cleared' mark since the last print: one more yes, never a refusal.
+    if (e.data && e.data.confirm === "bed") { $("toast").style.display = "none"; if (confirm(e.message + "\n\nStart the print anyway?")) return sendJob(true); return; }
+    toast("Not sent: " + e.message, 10000); }
   $("sh-go").disabled = false;
 }
 
@@ -505,7 +536,7 @@ function openDry(){
   for (const k of ["parked","bed_down","spools","door"]) $("dc-"+k).checked = false;
   const loaded = (S.printer.slots||[]).filter(x=>x.loaded).map(x=>x.slot);
   $("dry-loaded").textContent = loaded.length ? `Slot ${loaded.join(", ")} still loaded: the chamber is capped at 45° to protect the filament in the heads.` : "";
-  pickDry(dryPreset); $("drysheet").classList.add("open");
+  pickDry(dryPreset); $("drysheet").classList.add("open"); freshShot("dry-cam", "dry-cam-time");
 }
 function pickDry(k){ dryPreset = k; const v = ((S.drying||{}).presets||{})[k]; if (!v) return;
   for (const b of document.querySelectorAll("#dry-presets button")) b.className = b.id === "dp-"+k ? "on" : "";

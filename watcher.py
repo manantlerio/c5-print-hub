@@ -13,7 +13,8 @@
 # No sizes or heights in the context: from the low printer camera the model cannot judge them, and 'much smaller
 # than expected' was the main false flag (multi-part plates, black on the dark plate).
 # A pause is recoverable; a cancel is not.
-import base64, json, os, re, shutil, subprocess, threading, time, urllib.error, urllib.request
+import base64, json, os, re, shutil, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
+import security
 
 # Where the camera looks from: the phone webcam (top-down) when it answers, else the printer's own (low front).
 VIEWS = {"printer": "The camera sits low at the front of the bed, so the toolhead often hides a small or low part. ",
@@ -117,7 +118,9 @@ def _data_uri(f):
 def ask_openai(img, base_url, key, model, context="", timeout=120, view="printer", system=None, zoom=None):
     """One verdict from an OpenAI-compatible server (Chat Completions, images as base64 data URIs).
     Experimental. An answer that is not a verdict = 'unsure'; no answer (HTTP error, timeout) = 'error' (unreachable),
-    as for the Claude backends. A model that cannot take images says so in the reason ('no_images': True)."""
+    as for the Claude backends. A model that cannot take images says so in the reason ('no_images': True).
+    Redirects are never followed (the key would go with them) and the server's own reply text is never passed back:
+    the base URL is typed by hand, so it could point at something on your network that is not an AI."""
     url = base_url.rstrip("/") + "/chat/completions"
     content = [{"type": "image_url", "image_url": {"url": _data_uri(f)}} for f in [img] + ([zoom] if zoom else [])]
     content.append({"type": "text", "text": (context + "\n" if context else "") + "Verdict for this frame?"})
@@ -128,10 +131,12 @@ def ask_openai(img, base_url, key, model, context="", timeout=120, view="printer
         head["Authorization"] = f"Bearer {key}"
     try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=head)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            out = json.loads(r.read() or b"{}")
+        with security.urlopen(req, timeout) as r:
+            out = json.loads(r.read(5_000_000) or b"{}")
     except urllib.error.HTTPError as e:
-        msg = e.read().decode(errors="ignore")[:400]
+        if 300 <= e.code < 400:
+            return {"verdict": "error", "reason": f"unreachable: HTTP {e.code} redirect, not followed - type the final address"}
+        msg = e.read(4000).decode(errors="ignore")
         try:
             j = json.loads(msg)
             j = j[0] if isinstance(j, list) and j else j  # Gemini can answer with a list
@@ -140,14 +145,17 @@ def ask_openai(img, base_url, key, model, context="", timeout=120, view="printer
             pass
         if e.code in (400, 404, 415, 422) and any(w in str(msg).lower() for w in NO_IMAGES):
             return {"verdict": "error", "no_images": True,
-                    "reason": f"this model does not take images - pick a vision model ({msg})"[:200]}
-        return {"verdict": "error", "reason": f"unreachable: HTTP {e.code}: {msg}"[:200]}
-    except Exception as e:  # timeout, refused, DNS, bad JSON body
-        return {"verdict": "error", "reason": f"unreachable: {e}"[:200]}
+                    "reason": "this model does not take images - pick a vision model"}
+        return {"verdict": "error", "reason": f"unreachable: HTTP {e.code}" + (" (check the key)" if e.code in (401, 403) else "")}
+    except ValueError:
+        return {"verdict": "error", "reason": "unreachable: the reply was not Chat Completions JSON"}
+    except Exception as e:  # timeout, refused, DNS
+        return {"verdict": "error", "reason": f"unreachable: {type(e).__name__}"
+                + (": timed out" if "timed out" in str(e) else "")}
     try:
         text = out["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        return {"verdict": "unsure", "reason": f"no answer in the reply: {json.dumps(out)[:150]}", "cost": None}
+        return {"verdict": "unsure", "reason": "no answer in the reply", "cost": None}
     if isinstance(text, list):  # some servers send content parts
         text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
     m = re.search(r"\{[^{}]*\"verdict\"[^{}]*\}", text or "")
@@ -156,7 +164,7 @@ def ask_openai(img, base_url, key, model, context="", timeout=120, view="printer
     except ValueError:
         v = None
     if not isinstance(v, dict) or str(v.get("verdict")).lower() not in VERDICTS:
-        return {"verdict": "unsure", "reason": f"answer was not a verdict: {(text or '')[:150]}", "cost": None}
+        return {"verdict": "unsure", "reason": f"answer was not a verdict ({len(text or '')} characters)", "cost": None}
     v["verdict"] = str(v["verdict"]).lower()
     v["cost"] = None  # price unknown for other providers
     return v
@@ -201,7 +209,7 @@ def ask_api(img, key, context="", model="haiku", timeout=120, view="printer", sy
     for attempt in (1, 2):
         req = urllib.request.Request(API_URL, data=json.dumps(body).encode(), headers=head)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with security.urlopen(req, timeout) as r:
                 out = json.loads(r.read())
             break
         except urllib.error.HTTPError as e:
@@ -314,14 +322,21 @@ class Watcher:
         return ask_claude(img, self.claude, self.dir, context, model, view=view, system=system, zoom=zoom, api_key=key)
 
     def notify(self, msg, priority="high"):
+        """Optional phone push through ntfy (ntfy.sh or your own server), off unless a topic is set. The topic is
+        the only secret on a public server, so make it long and random (the setup page does); an access token
+        (ntfy_token) locks it to you."""
         self.log(f"push: {msg}")
         topic = self.cfg.get("ntfy_topic")
-        if topic:  # optional phone push via ntfy.sh, off unless a topic is set in config.json
+        if topic:
+            server = (self.cfg.get("ntfy_server") or "https://ntfy.sh").rstrip("/")
+            head = {"Title": "C5 Print Hub", "Priority": priority}
+            if self.cfg.get("ntfy_token"):
+                head["Authorization"] = f"Bearer {self.cfg['ntfy_token']}"
             try:
-                urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode(),
-                                                              headers={"Title": "C5 Print Hub", "Priority": priority}), timeout=10)
+                security.urlopen(urllib.request.Request(f"{server}/{urllib.parse.quote(topic)}", data=msg.encode(),
+                                                        headers=head), 10).close()
             except Exception as e:
-                self.log(f"notify failed: {e}")
+                self.log(f"notify failed: {type(e).__name__} {getattr(e, 'code', '')}")
 
     def record(self, s, v):
         """Evidence for the watcher review: one line per check, the frames worth keeping, a total per print."""

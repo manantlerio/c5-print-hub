@@ -15,9 +15,11 @@ BASE = f"http://127.0.0.1:{CFG['port']}"
 
 
 def call(path, data=None, raw=False, method=None):
+    # X-Hub-Key is the random api_token from config.json (never the PIN), taken only from this PC.
     body = data if isinstance(data, (bytes, type(None))) else json.dumps(data).encode()
+    ctype = "application/octet-stream" if isinstance(data, bytes) else "application/json"
     req = urllib.request.Request(BASE + path, data=body, method=method or ("POST" if body is not None else "GET"),
-                                 headers={"X-Hub-Key": CFG["password"], "Content-Type": "application/json"})
+                                 headers={"X-Hub-Key": CFG.get("api_token", ""), "Content-Type": ctype})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             out = r.read()

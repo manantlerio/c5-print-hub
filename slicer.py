@@ -27,19 +27,44 @@ def template_ready():
     return os.path.isfile(TEMPLATE)
 
 
+# A sliced 3MF is a zip: what it unpacks to is checked before anything is read, so a small file that unpacks to
+# gigabytes (a zip bomb) is refused instead of filling the memory.
+MAX_UNZIPPED = 500 * 1024 * 1024
+
+
+def zip_sizes_ok(z, limit=MAX_UNZIPPED):
+    if sum(i.file_size for i in z.infolist()) > 2 * limit or any(i.file_size > limit for i in z.infolist()):
+        raise ValueError(f"this 3MF unpacks to more than {limit // 2 ** 20} MB")
+
+
+def zip_entry(z, name, limit=MAX_UNZIPPED):
+    """One entry of an open zip, refused if it unpacks to more than limit bytes."""
+    info = z.getinfo(name)
+    if info.file_size > limit:
+        raise ValueError(f"{name} in this 3MF unpacks to more than {limit // 2 ** 20} MB")
+    with z.open(info) as f:
+        return f.read(limit + 1)[:limit]
+
+
+def zip_head(z, name, n):
+    with z.open(name) as f:
+        return f.read(n)
+
+
 def check_template(path):
     """Problems with a Flash Studio export as a template (empty list = good)."""
     try:
         with zipfile.ZipFile(path) as z:
+            zip_sizes_ok(z)
             names = set(z.namelist())
             if "Metadata/project_settings.config" not in names:
                 return ["no Flash Studio settings in it (Metadata/project_settings.config)"]
             if "Metadata/plate_1.gcode" not in names:
                 return ["no sliced plate in it - slice the plate in Flash Studio first"]
-            cfg = json.loads(z.read("Metadata/project_settings.config"))
-            head = z.read("Metadata/plate_1.gcode")[:4000].decode(errors="ignore")
+            cfg = json.loads(zip_entry(z, "Metadata/project_settings.config", 50 * 2 ** 20))
+            head = zip_head(z, "Metadata/plate_1.gcode", 4000).decode(errors="ignore")
     except (zipfile.BadZipFile, OSError, ValueError) as e:
-        return [f"not a readable 3MF: {e}"]
+        return [f"not a readable 3MF: {str(e)[:100]}"]
     out = []
     if "Flash Studio" not in head and "Orca-Flashforge" not in head and "OrcaSlicer" not in head:
         out.append("not sliced by Flash Studio")
@@ -411,10 +436,20 @@ def extrusion_bands(gcode, dia=1.75):
 def read_gcode(path):
     """Plain G-code, or a sliced .3mf (Flash Studio 'Export plate sliced file')."""
     if path.lower().endswith(".3mf"):
-        z = zipfile.ZipFile(path)
-        name = next((n for n in z.namelist() if re.match(r"Metadata/plate_\d+\.gcode$", n)), None)
-        return z.read(name).decode(errors="ignore") if name else None
+        with zipfile.ZipFile(path) as z:
+            name = next((n for n in z.namelist() if re.match(r"Metadata/plate_\d+\.gcode$", n)), None)
+            return zip_entry(z, name).decode(errors="ignore") if name else None
     return open(path, encoding="utf-8", errors="ignore").read()
+
+
+def all_plates(path):
+    """Every plate's G-code in a sliced .3mf (or the one plain file), for the hard check."""
+    if not path.lower().endswith(".3mf"):
+        return [read_gcode(path)]
+    with zipfile.ZipFile(path) as z:
+        zip_sizes_ok(z)
+        return [zip_entry(z, n).decode(errors="ignore") for n in z.namelist()
+                if re.match(r"Metadata/plate_\d+\.gcode$", n)]
 
 
 def stats(text):
@@ -426,7 +461,8 @@ def stats(text):
     colours = re.findall(r'^; <filament id="(\d)"[^>]*color="(#[0-9A-Fa-f]{6})"', head, re.M)
     if not colours:  # no per-filament lines: used tools from the grams, colours from the settings
         cols = [c.strip() for c in (header(text, "filament_colour") or "").split(";")]
-        colours = [(str(i + 1), cols[i]) for i, w in enumerate(grams) if w > 0 and i < len(cols)]
+        colours = [(str(i + 1), cols[i]) for i, w in enumerate(grams) if w > 0 and i < len(cols)
+                   and re.fullmatch(r"#[0-9A-Fa-f]{6}", cols[i])]  # only #RRGGBB ever reaches the page
     return {"time": g(r"^; estimated printing time \(normal mode\) = (.+)$"),
             "grams": g(r"^; total filament used \[g\] = (.+)$"),
             "grams_per_tool": grams, "layers": g(r"^; total layers count = (\d+)"),
@@ -457,9 +493,9 @@ def part_settings(path):
     settings block only holds the plate-wide values, so these are the ones it does not show."""
     out = []
     try:
-        z = zipfile.ZipFile(path)
-        xml = z.read("Metadata/model_settings.config").decode(errors="ignore")
-    except (OSError, KeyError, zipfile.BadZipFile):
+        with zipfile.ZipFile(path) as z:
+            xml = zip_entry(z, "Metadata/model_settings.config", 50 * 2 ** 20).decode(errors="ignore")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return out
     for obj in re.findall(r"<object\b.*?</object>", xml, re.S):
         meta = re.findall(r'<metadata key="([^"]+)" value="([^"]*)"', re.sub(r"<part\b.*?</part>", "", obj, flags=re.S))
@@ -501,6 +537,117 @@ def preset_check(text, house):
             for i in used if i >= len(names) or names[i] not in house]
 
 
+# ---------- hard limits: nothing on the phone overrides these ----------
+# Every line is read the way a firmware would: upper case, leading spaces, a line number (N12), a checksum (*34) and
+# comments removed, "M 104" and "M0104" taken as M104, Klipper commands and macros with KEY=value parameters.
+HARD_CAPS = {"nozzle": 300, "bed": 110, "chamber": 65}  # config "hard_caps" can only lower these
+DENY = {
+    "SAVE_CONFIG": "writes the printer's own config", "FIRMWARE_RESTART": "restarts the firmware",
+    "RESTART": "restarts the firmware", "SAVE_VARIABLE": "writes the printer's saved variables",
+    "RUN_SHELL_COMMAND": "runs a program on the printer", "SET_KINEMATIC_POSITION": "forces the printer's position",
+    "FORCE_MOVE": "moves a motor with no limits", "MANUAL_STEPPER": "moves a motor with no limits",
+    "SET_TMC_CURRENT": "changes motor current", "SET_TMC_FIELD": "changes motor driver settings",
+    "PID_CALIBRATE": "heater tuning run", "Z_OFFSET_APPLY_PROBE": "changes the saved Z offset",
+    "Z_OFFSET_APPLY_ENDSTOP": "changes the saved Z offset", "SET_GCODE_OFFSET": "shifts every move (crash risk)",
+    "M500": "saves settings to the printer", "M502": "factory reset of settings", "M997": "firmware update",
+    "M999": "restarts the firmware", "M302": "allows cold extrusion", "M211": "soft endstops on/off",
+    "M121": "turns endstops off", "M564": "allows moves outside the bed", "M92": "changes steps per mm",
+    "M851": "changes the probe offset", "M206": "changes the home offset", "M428": "changes the home offset",
+    "M301": "changes heater tuning", "M304": "changes heater tuning", "M303": "heater tuning run",
+    "M906": "changes motor current", "M907": "changes motor current", "M913": "changes motor current",
+    "M350": "changes microstepping", "M569": "changes motor drivers", "M584": "changes motor mapping",
+    "M28": "writes a file on the printer", "M29": "writes a file on the printer", "M30": "deletes a file on the printer"}
+_CMD = re.compile(r"([GMT])\s*0*(\d+)(?:\.(\d+))?(?!\d)")
+_WORD = re.compile(r"[A-Z_][A-Z0-9_]*")
+_PARAM = re.compile(r"([A-Z])\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))")
+_KV = re.compile(r"([A-Z_][A-Z0-9_]*)\s*=\s*\"?([-+]?(?:\d+(?:\.\d*)?|\.\d+))")
+_HEAT_KEY = re.compile(r"TEMP|EXTRUDER|HOTEND|NOZZLE|BED|CHAMBER")
+
+
+def gcode_cmd(line):
+    """(command, rest of the line) as the firmware sees it, or (None, '')."""
+    s = line.split(";", 1)[0]
+    if "(" in s:
+        s = re.sub(r"\([^)]*\)", " ", s)
+    s = s.strip().upper()
+    if not s:
+        return None, ""
+    if s[0] == "N":
+        m = re.match(r"N\s*\d+\s*", s)
+        s = s[m.end():] if m else s
+    if "*" in s:
+        s = s.split("*", 1)[0].rstrip()
+    m = _CMD.match(s)
+    if m:
+        return f"{m.group(1)}{int(m.group(2))}" + (f".{m.group(3)}" if m.group(3) else ""), s[m.end():]
+    m = _WORD.match(s)
+    return (m.group(0), s[m.end():]) if m else (None, "")
+
+
+def _heater(name):
+    n = name.upper()
+    return "bed" if "BED" in n else "chamber" if "CHAMBER" in n else "nozzle"
+
+
+def heats(cmd, rest):
+    """[(heater, temperature, tool or None)] that one command asks for: classic M-codes (S and R), RepRapFirmware
+    G10 / M568, Klipper SET_HEATER_TEMPERATURE / TEMPERATURE_WAIT and any macro with a temperature-like KEY=value."""
+    out = []
+    if cmd in ("M104", "M109", "M568", "M140", "M190", "M141", "M191") or (cmd == "G10" and re.search(r"[SR]", rest)):
+        heater = "bed" if cmd in ("M140", "M190") else "chamber" if cmd in ("M141", "M191") else "nozzle"
+        p = {}
+        for k, v in _PARAM.findall(rest):
+            p.setdefault(k, []).append(float(v))
+        tool = int(p["T"][0]) if "T" in p else int(p["P"][0]) if cmd in ("G10", "M568") and "P" in p else None
+        out += [(heater, v, tool) for k in ("S", "R") for v in p.get(k, [])]
+    elif cmd in ("SET_HEATER_TEMPERATURE", "TEMPERATURE_WAIT"):
+        kv = dict(_KV.findall(rest))
+        name = (re.search(r"(?:HEATER|SENSOR)\s*=\s*\"?([A-Z0-9_ ]+)", rest) or [None, "extruder"])[1]
+        out += [(_heater(name), float(kv[k]), None) for k in ("TARGET", "MINIMUM") if k in kv]
+    elif cmd[0] not in "GMT" or not cmd[1:2].isdigit():
+        out += [(_heater(k), float(v), None) for k, v in _KV.findall(rest) if _HEAT_KEY.search(k)]
+    return out
+
+
+def hard_caps(cfg_caps=None):
+    caps = dict(HARD_CAPS)
+    for k, v in (cfg_caps or {}).items():
+        if k in caps and isinstance(v, (int, float)):
+            caps[k] = min(caps[k], v)
+    return caps
+
+
+def hard_check(text, caps=None):
+    """Reasons a file is never sent, whatever is ticked: a nozzle, bed or chamber temperature over the hardware cap,
+    or a command that writes the printer's config or works below the normal print level (see DENY)."""
+    caps = hard_caps(caps)
+    top, denied = {}, {}
+    for n, line in enumerate((text or "").splitlines(), 1):
+        st = line.lstrip()
+        if not st or st[0] == ";" or (st[0] in "Gg" and st[1:3] in ("1 ", "0 ")):
+            continue  # comments and moves: most of the file
+        cmd, rest = gcode_cmd(st)
+        if not cmd:
+            continue
+        if cmd in DENY:
+            denied.setdefault(cmd, (n, DENY[cmd]))
+        elif cmd == "G92" and re.search(r"[XYZ]", rest):
+            denied.setdefault("G92 X/Y/Z", (n, "sets the position without moving"))
+        for heater, v, _ in heats(cmd, rest):
+            if v > top.get(heater, (0, 0))[0]:
+                top[heater] = (v, n)
+    out = [f"{h} {v:g}C at line {n} is over the hard limit of {caps[h]}C" for h, (v, n) in top.items() if v > caps[h]]
+    out += [f"{c} at line {n}: {why}" for c, (n, why) in denied.items()]
+    return out
+
+
+def hard_check_file(path, caps=None):
+    reasons = []
+    for text in all_plates(path):
+        reasons += [r for r in hard_check(text, caps) if r not in reasons]
+    return reasons
+
+
 def sanity(text, ranges):
     """Machine checks for a sliced file from anywhere (the full gate only runs on files this hub slices):
     1.75 mm filament, extrusion on the bed, and every used tool's nozzle and the bed inside the label range of the
@@ -515,26 +662,30 @@ def sanity(text, ranges):
     x0 = y0 = 1e9
     x1 = y1 = -1e9
     for line in text.splitlines():
-        if line[:1] == "T" and line[1:2].isdigit():
-            t = int(line[1])
+        st = line.lstrip()
+        if not st or st[0] == ";":
             continue
-        c = line.split(";")[0]
-        if c.startswith(("M104", "M109")):
-            m, mt = re.search(r"S(\d+)", c), re.search(r"T(\d)", c)
-            if m:
-                k = int(mt.group(1)) if mt else t
-                hot[k] = max(hot.get(k, 0), int(m.group(1)))
-        elif c.startswith(("M140", "M190")):
-            m = re.search(r"S(\d+)", c)
-            if m:
-                bed.append(int(m.group(1)))
-        elif c.startswith("G1 "):
-            mx, my, me = re.search(r"X(-?[\d.]+)", c), re.search(r"Y(-?[\d.]+)", c), re.search(r"E(-?[\d.]+)", c)
-            nx = float(mx.group(1)) if mx else x
-            ny = float(my.group(1)) if my else y
-            if me and float(me.group(1)) > 0 and None not in (nx, ny):
-                x0, x1, y0, y1 = min(x0, nx), max(x1, nx), min(y0, ny), max(y1, ny)
-            x, y = nx, ny
+        if st[:3] not in ("G1 ", "g1 "):
+            cmd, rest = gcode_cmd(st)
+            if not cmd:
+                continue
+            if cmd[0] == "T" and cmd[1:].isdigit():
+                t = int(cmd[1:])
+                continue
+            for heater, v, tool in heats(cmd, rest):
+                if heater == "nozzle":
+                    k = t if tool is None else tool
+                    hot[k] = max(hot.get(k, 0), int(v))
+                elif heater == "bed":
+                    bed.append(int(v))
+            continue
+        c = st.split(";")[0].upper()
+        mx, my, me = re.search(r"X(-?[\d.]+)", c), re.search(r"Y(-?[\d.]+)", c), re.search(r"E(-?[\d.]+)", c)
+        nx = float(mx.group(1)) if mx else x
+        ny = float(my.group(1)) if my else y
+        if me and float(me.group(1)) > 0 and None not in (nx, ny):
+            x0, x1, y0, y1 = min(x0, nx), max(x1, nx), min(y0, ny), max(y1, ny)
+        x, y = nx, ny
     if x1 > -1e9 and (x0 < -1 or y0 < -1 or x1 > 257 or y1 > 257):
         reasons.append(f"extrudes outside the bed (X {x0:.0f}..{x1:.0f}, Y {y0:.0f}..{y1:.0f})")
     per = header(text, r"filament used \[g\]")
@@ -1062,6 +1213,7 @@ def write_shifted(src, dst, dz):
         return []
     import hashlib
     zin = zipfile.ZipFile(src)
+    zip_sizes_ok(zin)
     gname = next(n for n in zin.namelist() if re.match(r"Metadata/plate_\d+\.gcode$", n))
     with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():

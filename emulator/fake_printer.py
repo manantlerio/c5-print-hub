@@ -1,6 +1,6 @@
 # Fake Creator 5 Pro: answers the printer's LAN API (:8898) and serves an MJPEG camera (:8080) on 127.0.0.1,
 # so the hub and ForkaSlicer send can be tested while the real printer is busy. Stdlib only.
-# Run: python -I emulator/fake_printer.py [--speed 60] [--multi-cam]
+# Run: python -I emulator/fake_printer.py [--speed 60] [--multi-cam] [--host 127.0.0.3]
 #
 # Copied from the real printer (fw 2.0.0, 2026-10-25): every /detail field and its shape, status values
 # ready / printing / pause / completed / cancel, {"code": 0, "message": "Success"} on upload, start and control,
@@ -459,6 +459,7 @@ class Cam(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--speed", type=float, default=60, help="print-time seconds per real second")
+    ap.add_argument("--host", default="127.0.0.1", help="loopback address to answer on (127.0.0.3 keeps clear of another fake printer)")
     ap.add_argument("--api-port", type=int, default=8898)
     ap.add_argument("--cam-port", type=int, default=8080)
     ap.add_argument("--frames", default=os.path.join(HERE, "..", "watch"), help="folder of camera JPEGs to loop")
@@ -472,10 +473,10 @@ def main():
     Cam.multi = a.multi_cam
     threading.Thread(target=sim.run, daemon=True).start()
     for port, handler in ((a.cam_port, Cam), (a.api_port, Api)):
-        srv = ThreadingHTTPServer(("127.0.0.1", port), handler)
+        srv = ThreadingHTTPServer((a.host, port), handler)
         srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-    sim.note(f"fake Creator 5 Pro on 127.0.0.1:{a.api_port} (camera :{a.cam_port}, {len(Cam.frames)} frames), "
+    sim.note(f"fake Creator 5 Pro on {a.host}:{a.api_port} (camera :{a.cam_port}, {len(Cam.frames)} frames), "
              f"serial {SERIAL} check code {CHECK}, speed x{a.speed:g}")
     while True:
         time.sleep(3600)
