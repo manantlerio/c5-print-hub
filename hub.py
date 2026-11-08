@@ -60,7 +60,8 @@ CFG_LOCK = threading.Lock()
 def load_cfg():
     cfg = dict(DEFAULTS)
     if os.path.exists(CFG_PATH):
-        cfg.update(json.load(open(CFG_PATH, encoding="utf-8")))
+        cfg.update(security.cfg_from_disk(json.load(open(CFG_PATH, encoding="utf-8")),
+                                          lambda m: print(m, file=sys.stderr)))
     # Older versions kept the PIN in plain text and signed one shared cookie with "secret": hash the PIN and drop
     # both (every phone logs in once more). A PIN the old version made up before setup is dropped, never kept.
     if cfg.get("password") and cfg.get("pin_chosen") and not cfg.get("pin_hash"):
@@ -69,16 +70,19 @@ def load_cfg():
     cfg.pop("secret", None)
     if not cfg.get("api_token"):  # hubctl.py on this PC only (X-Hub-Key from 127.0.0.1), never the PIN
         cfg["api_token"] = secrets.token_urlsafe(32)
-    json.dump(cfg, open(CFG_PATH + ".tmp", "w", encoding="utf-8"), indent=1)
-    os.replace(CFG_PATH + ".tmp", CFG_PATH)
+    write_cfg(cfg)
     return cfg
+
+
+def write_cfg(cfg):
+    """config.json with keys and codes encrypted for this Windows account (security.SECRET_KEYS)."""
+    security.write_private(CFG_PATH, json.dumps(security.cfg_for_disk(cfg), indent=1))
 
 
 def save_cfg(**changes):
     with CFG_LOCK:
         CFG.update(changes)
-        json.dump(CFG, open(CFG_PATH + ".tmp", "w", encoding="utf-8"), indent=1)
-        os.replace(CFG_PATH + ".tmp", CFG_PATH)
+        write_cfg(CFG)
 
 
 def webcam_stream(url):
@@ -918,7 +922,7 @@ def push_events():
                     WATCH.notify(f"Done: {prev['file']} ({hms(prev.get('elapsed_s'))})", "default")
                 if st in ("completed", "cancel") and was in ACTIVE:
                     history(prev, st)
-                elif st == "cancel" and was in ACTIVE and not mine("cancel"):
+                if st == "cancel" and was in ACTIVE and not mine("cancel"):
                     WATCH.notify(f"Cancelled on the printer: {prev['file']} at layer {prev['layer']}/{prev['layers']}")
             if s.get("eta_from") == "pace" and not ETA.first and s["file"] == ETA.file:
                 ETA.first = (time.time(), s["progress"], s["left_s"], s["printer_left_s"])

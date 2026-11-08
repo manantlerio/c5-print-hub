@@ -218,7 +218,12 @@ def main(template):
     code, man, _ = call("/manifest.json", raw=True)
     check("app name in the manifest", b"C5 Print Hub" in man)
 
-    key = json.load(open(os.path.join(SIM, "config.json")))["api_token"]
+    sys.path.insert(1, os.path.dirname(HERE))
+    import security
+    disk = json.load(open(os.path.join(SIM, "config.json")))
+    key = security.cfg_from_disk(dict(disk))["api_token"]
+    check("api_token encrypted in config.json on Windows", os.name != "nt" or (disk["api_token"].startswith("dpapi:")
+          and key not in json.dumps(disk)), disk["api_token"][:12])
     code, r = call("/api/status", key="2468", cookie="")
     check("the PIN is not an API key", code == 401, code)
     s = wait(lambda s: s.get("online"), key=key)

@@ -28,6 +28,91 @@ def check_secret(text, stored):
     return bool(stored) and hmac.compare_digest(got, want)
 
 
+# ---------- keys and codes saved in config.json ----------
+# Encrypted with Windows DPAPI under the Windows account that runs the hub, so nothing extra to type: the same login
+# opens them, a copy of config.json on another PC or account does not. Elsewhere (no DPAPI) they stay as typed and
+# the file is made readable by its owner only.
+SECRET_KEYS = ("check_code", "anthropic_api_key", "openai_api_key", "ntfy_token", "ntfy_topic", "totp_secret",
+               "api_token", "webcam_url")
+_TAG = "dpapi:"
+_ENTROPY = b"C5 Print Hub config v1"
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    _crypt32, _kernel32 = ctypes.WinDLL("crypt32", use_last_error=True), ctypes.WinDLL("kernel32")
+    _kernel32.LocalFree.argtypes, _kernel32.LocalFree.restype = [ctypes.c_void_p], ctypes.c_void_p
+    for _f in (_crypt32.CryptProtectData, _crypt32.CryptUnprotectData):
+        _f.argtypes = [ctypes.POINTER(_Blob), ctypes.c_void_p, ctypes.POINTER(_Blob), ctypes.c_void_p,
+                       ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_Blob)]
+        _f.restype = wintypes.BOOL
+
+    def _dpapi(fn, data):
+        buf, ent = ctypes.create_string_buffer(data, len(data)), ctypes.create_string_buffer(_ENTROPY, len(_ENTROPY))
+        out = _Blob()
+        if not fn(ctypes.byref(_Blob(len(data), buf)), None, ctypes.byref(_Blob(len(_ENTROPY), ent)), None, None,
+                  0x1, ctypes.byref(out)):  # 0x1 = CRYPTPROTECT_UI_FORBIDDEN, never a prompt
+            raise OSError(ctypes.get_last_error(), "DPAPI failed")
+        try:
+            return ctypes.string_at(out.pbData, out.cbData)
+        finally:
+            _kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+    def protect(text):
+        if not text or str(text).startswith(_TAG):
+            return text
+        return _TAG + base64.b64encode(_dpapi(_crypt32.CryptProtectData, str(text).encode())).decode()
+
+    def unprotect(text):
+        """The plain value; raises OSError when it was saved by another Windows account or PC."""
+        if not isinstance(text, str) or not text.startswith(_TAG):
+            return text
+        return _dpapi(_crypt32.CryptUnprotectData, base64.b64decode(text[len(_TAG):])).decode()
+else:
+    def protect(text):
+        return text
+
+    def unprotect(text):
+        if isinstance(text, str) and text.startswith(_TAG):
+            raise OSError("saved with Windows DPAPI on another PC")
+        return text
+
+
+def cfg_for_disk(cfg):
+    """A copy of the config with the secret values encrypted, for json.dump."""
+    out = dict(cfg)
+    for k in SECRET_KEYS:
+        if out.get(k):
+            out[k] = protect(out[k])
+    return out
+
+
+def cfg_from_disk(cfg, log=print):
+    """Decrypts the secret values in place. One that cannot be opened (config copied from another PC or Windows
+    account) is cleared, so the setup page asks for it again; typed-in plain values are kept and encrypted on save."""
+    for k in SECRET_KEYS:
+        try:
+            cfg[k] = unprotect(cfg.get(k))
+        except (OSError, ValueError) as e:
+            log(f"config.json: {k} was saved on another PC or Windows account and cannot be opened here; "
+                f"enter it again on the setup page ({e})")
+            cfg[k] = ""
+    return cfg
+
+
+def write_private(path, text):
+    """Writes the file through a temp file; on non-Windows the file is owner-only (DPAPI covers Windows)."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 # ---------- TOTP (RFC 6238, the 6-digit codes of any authenticator app) ----------
 
 def totp_new_secret():

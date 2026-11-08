@@ -120,8 +120,11 @@ everything you can do at home: start a print, pause, cancel, temperatures, speed
   is cleared when the address changes, and the server's own reply text is never shown.
 - **Pages**: printer names and colours are checked before they reach the page; the pages cannot be framed by
   another site and load nothing from anywhere else.
-- **Secrets on disk**: the PIN and passphrase are stored as scrypt hashes. API keys, the printer check code and the
-  ntfy token are in plain text in `config.json`, so keep the folder inside your own Windows user profile.
+- **Secrets on disk**: the PIN and passphrase are stored as scrypt hashes. API keys, the printer check code, the
+  authenticator secret, the ntfy topic and token and the camera address are encrypted in `config.json` with Windows
+  DPAPI, locked to the Windows account that runs the hub. Nothing to set up and no extra password: the same login
+  opens them, a copy of the file on another PC or account does not. Moved the hub to a new PC? The setup page asks
+  for those values again. You can still type a key into `config.json` by hand; it is encrypted at the next start.
 - **hubctl.py** uses a random API token from `config.json`, accepted from this PC only. The PIN is never an API key.
 
 ### Away from home: pick one
@@ -203,7 +206,7 @@ Ways to run it:
   optionally a strong model for the re-check (blank = the fast model again). The model names the presets fill in are
   examples only. The prompt and the pause rule were tuned on Claude, so watch the first prints closely.
 
-API keys are stored in plain text in `config.json` on this PC and never shown on the page again. Tap Test on the
+API keys are stored encrypted on this PC (see Security) and never shown on the page again. Tap Test on the
 setup page to try one check on the printer camera with the AI you chose; a model that cannot read images gives a
 plain error there. Without the watcher, the drying bed check asks you to look at the bed yourself and unlock it.
 

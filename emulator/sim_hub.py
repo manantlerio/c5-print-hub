@@ -51,7 +51,7 @@ def main():
             shutil.copytree(os.path.join(HUB, "jobs", jid), dst, ignore=shutil.ignore_patterns("slice"))
 
     path = os.path.join(HUB, "config.json")
-    real = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+    real = security.cfg_from_disk(json.load(open(path, encoding="utf-8"))) if os.path.exists(path) else {}
     cfg = {"printer_ip": a.printer_ip, "serial": fake_printer.SERIAL, "check_code": fake_printer.CHECK,
            "port": a.port, "host": "127.0.0.1", "colours": real.get("colours") or ["#FFFFFF", "#1E5BD8", "#F5D000", "#FF69B4"],
            "leveling": real.get("leveling", False),

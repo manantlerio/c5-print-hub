@@ -302,6 +302,16 @@ def live(ntfy):
     cfg = json.load(open(os.path.join(SIM, "config.json")))
     check("PIN stored hashed only (scrypt), no plain PIN in config.json", cfg.get("pin_hash", "").startswith("scrypt$")
           and "1357" not in json.dumps(cfg) and "password" not in cfg)
+    if os.name == "nt":
+        check("check code saved encrypted for this Windows account (DPAPI), never in plain text",
+              cfg.get("check_code", "").startswith("dpapi:") and "simcheck" not in json.dumps(cfg)
+              and security.cfg_from_disk(dict(cfg))["check_code"] == "simcheck", cfg.get("check_code", "")[:12])
+        bad = security.cfg_from_disk({"openai_api_key": "dpapi:" + base64.b64encode(b"x" * 40).decode(),
+                                      "ntfy_token": "typed-by-hand"}, log=lambda m: None)
+        check("a key saved on another PC is cleared (asked again), a hand-typed plain key is kept",
+              bad["openai_api_key"] == "" and bad["ntfy_token"] == "typed-by-hand", bad)
+        check("plain key typed into config.json gets encrypted on save",
+              security.cfg_for_disk({"ntfy_token": "typed-by-hand"})["ntfy_token"].startswith("dpapi:"))
     r = lan("POST", "/api/setup/done", {}, cookie=sc)
     check("setup: done", r[0] == 200, r[:3])
     check("setup link removed, its cookie dead", not os.path.exists(os.path.join(SIM, "setup-url.txt"))
@@ -320,9 +330,9 @@ def live(ntfy):
     r = lan("GET", "/api/raw", cookie=lan_a)
     check("/api/raw leaves out the cloud registration codes and MAC address", r[0] == 200
           and b"RegisterCode" not in r[2] and b"macAddr" not in r[2], r[2][:200])
-    r = lan("GET", "/api/status", headers={"X-Hub-Key": cfg["api_token"], "X-Forwarded-For": "8.8.8.8"})
+    r = lan("GET", "/api/status", headers={"X-Hub-Key": security.cfg_from_disk(dict(cfg))["api_token"], "X-Forwarded-For": "8.8.8.8"})
     check("API token through a proxy: refused", r[0] == 403, r[:3])
-    r = lan("GET", "/api/status", headers={"X-Hub-Key": cfg["api_token"]})
+    r = lan("GET", "/api/status", headers={"X-Hub-Key": security.cfg_from_disk(dict(cfg))["api_token"]})
     check("API token (hubctl) from this PC works", r[0] == 200, r[:3])
     r = lan("GET", "/api/status", headers={"X-Hub-Key": "1357"})
     check("the PIN is not an API key", r[0] == 401, r[:3])
@@ -431,7 +441,7 @@ def live(ntfy):
     check("remote port: unknown Host refused", r[0] == 421, r[:2])
     r = rem("POST", "/login", {"password": "1357"})
     check("remote port: the PIN alone never logs in", r[0] in (403, 409), r[:3])
-    r = rem("GET", "/api/status", headers={"X-Hub-Key": cfg["api_token"]})
+    r = rem("GET", "/api/status", headers={"X-Hub-Key": security.cfg_from_disk(dict(cfg))["api_token"]})
     check("remote port: the API token is not accepted", r[0] == 401, r[:3])
     r = rem("GET", "/api/status", cookie="__Host-hub=" + lan_a.split("=", 1)[1])
     check("remote port: a home-network session is not accepted", r[0] == 401, r[:3])
@@ -563,6 +573,10 @@ def live(ntfy):
     r = rem("POST", "/api/control", {"action": "cancel"}, cookie=rc)
     check("remote cancel works", r[0] == 200, r[:3])
     check("remote cancel pushed to the phone", until(lambda: any("cancelled remotely" in p for p in pushes()), 10), pushes())
+    hub_cancel_at = time.time()
+    time.sleep(6)
+    check("a cancel from the hub is not also pushed as 'Cancelled on the printer'",
+          not any("Cancelled on the printer" in p for p in pushes()), pushes()[-3:])
     bed = until(lambda: js(rem("GET", "/api/status", cookie=rc)).get("bed", {}).get("needs_mark") and True, 20)
     check("after a print ends the bed counts as not marked cleared", bed)
     r = rem("POST", f"/api/jobs/{jid}/print", {"plate_clear": True, "allow_unchecked": True}, cookie=rc)
@@ -606,6 +620,18 @@ def live(ntfy):
     time.sleep(2.1)
     r = rem("POST", "/login", {"passphrase": PASS, "code": security.totp(secret, t=time.time() + 30)}, src="127.0.2.2")
     check("then remote login works again", r[0] == 200, r[:3])
+
+    # --- a cancel on the printer screen (past the 90 s in which a cancel counts as the hub's own) ---
+    cancels = re.findall(r"^(\S+ \S+) control cancel", open(os.path.join(SIM, "hub.log"), encoding="utf-8").read(), re.M)
+    last = time.mktime(time.strptime(cancels[-1], "%Y-%m-%d %H:%M:%S")) if cancels else hub_cancel_at
+    time.sleep(max(0, 95 - (time.time() - last)))
+    sim = lambda q: urllib.request.urlopen(f"http://{A['printer_ip']}:8898/sim/status?s={q}", timeout=5).read()
+    sim("printing")
+    until(lambda: js(rem("GET", "/api/status", cookie=rc))["printer"].get("status") == "printing", 20)
+    time.sleep(3)
+    sim("cancel")
+    check("a cancel on the printer screen is pushed to the phone",
+          until(lambda: any("Cancelled on the printer" in p for p in pushes()), 15), pushes()[-3:])
 
     # --- HTTPS port with your own certificate ---
     if A.get("https"):

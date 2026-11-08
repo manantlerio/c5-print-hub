@@ -10,7 +10,9 @@
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CFG = json.load(open(os.path.join(HERE, "config.json")))
+sys.path.insert(0, HERE)
+import security
+CFG = security.cfg_from_disk(json.load(open(os.path.join(HERE, "config.json"))))
 BASE = f"http://127.0.0.1:{CFG['port']}"
 
 
