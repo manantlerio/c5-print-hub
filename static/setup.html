@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14161a">
+<link rel="icon" href="/icon.svg">
+<title>C5 Print Hub - Setup</title>
+<style>
+:root { --bg:#14161a; --card:#1f2228; --line:#2e323a; --text:#eef0f3; --dim:#9aa1ac; --go:#2fbf71; --warn:#f0b429; --stop:#e5484d; --accent:#3d8bfd; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; padding:12px 16px 80px; max-width:760px; margin-inline:auto; }
+h1 { font-size:22px; margin:8px 0 2px; }
+h2 { font-size:17px; margin:0 0 6px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }
+.dim { color:var(--dim); font-size:14px; }
+.ok { color:#7ee2a8; font-weight:600; } .bad { color:#ff9b9e; font-weight:600; } .warn { color:#f5cf6b; }
+input[type=text], input[type=password], input[type=number] { font:inherit; width:100%; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:11px; margin:4px 0 8px; }
+label.f { display:block; margin-top:8px; font-weight:600; }
+button { font:inherit; font-weight:600; border:0; border-radius:12px; padding:11px 16px; background:var(--line); color:var(--text); cursor:pointer; min-height:44px; margin:4px 6px 4px 0; }
+button:disabled { opacity:.45; }
+.primary { background:var(--accent); color:#fff; } .go { background:var(--go); color:#06210f; }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.found { display:flex; gap:12px; align-items:center; border-top:1px solid var(--line); padding:10px 0; }
+.found img, .preview { background:#000; border-radius:10px; object-fit:contain; }
+.found img { width:120px; height:90px; flex:none; }
+.preview { width:100%; max-width:480px; aspect-ratio:4/3; display:block; margin-top:8px; }
+.msg { min-height:1.3em; margin-top:6px; font-size:15px; }
+ol { padding-left:20px; margin:6px 0; } li { margin:3px 0; }
+.step-n { display:inline-block; width:26px; height:26px; border-radius:50%; background:var(--line); text-align:center; line-height:26px; font-size:14px; margin-right:6px; }
+.done .step-n { background:var(--go); color:#06210f; }
+label.check { display:flex; gap:10px; align-items:center; padding:6px 0; }
+label.check input { width:22px; height:22px; flex:none; }
+code { background:#0006; padding:1px 5px; border-radius:5px; overflow-wrap:anywhere; }
+.card, .dim { overflow-wrap:anywhere; }
+.warnbox { border-left:4px solid var(--warn); padding:8px 12px; background:#3d321533; border-radius:6px; margin-top:8px; }
+</style>
+</head>
+<body>
+<h1>C5 Print Hub setup</h1>
+<div class="dim">For the Flashforge Creator 5 Pro, unofficial. Nothing here leaves your own network unless you turn on the watcher with an API key.</div>
+
+<div class="card" id="c-printer">
+  <h2><span class="step-n">1</span>Printer</h2>
+  <ol class="dim">
+    <li>On the printer screen, turn on <b>LAN Only</b> mode (network settings). The hub can only talk to the printer in LAN Only mode.</li>
+    <li>The printer screen shows its <b>check code</b> in LAN Only mode, and its <b>serial number</b> on the device info screen. Type both below exactly as shown.</li>
+  </ol>
+  <button onclick="findPrinter()" id="b-find">Find my printer</button><span class="dim" id="find-msg"></span>
+  <div id="found"></div>
+  <label class="f">Printer address</label><input type="text" id="ip" placeholder="192.168.1.50" inputmode="decimal">
+  <label class="f">Serial number</label><input type="text" id="serial" autocomplete="off">
+  <label class="f">Check code</label><input type="text" id="check" autocomplete="off">
+  <button class="primary" onclick="savePrinter()">Connect and test</button>
+  <div class="msg" id="printer-msg"></div>
+</div>
+
+<div class="card" id="c-pin">
+  <h2><span class="step-n">2</span>Your PIN</h2>
+  <div class="dim">Every phone asks for this PIN once. 4 to 8 digits.</div>
+  <input type="password" id="pin" inputmode="numeric" autocomplete="new-password" placeholder="PIN">
+  <button class="primary" onclick="savePin()">Save PIN</button>
+  <div class="msg" id="pin-msg"></div>
+</div>
+
+<div class="card" id="c-cam">
+  <h2><span class="step-n">3</span>Cameras</h2>
+  <div class="dim">The printer's own camera works by itself once the printer is connected.</div>
+  <button onclick="camPrinter()">Show printer camera</button>
+  <img class="preview" id="cam-printer" alt="" style="display:none">
+  <div class="msg" id="cam-printer-msg"></div>
+  <h2 style="margin-top:14px">Phone camera (optional)</h2>
+  <div class="dim">An old phone above the bed gives the best view. Install an IP camera app on it (for example IP Webcam on Android), start its server, and type the address the app shows, like <code>http://192.168.1.60:8080</code>. The phone must be on the same Wi-Fi as this PC.</div>
+  <input type="text" id="webcam" placeholder="http://192.168.1.60:8080">
+  <button onclick="camTest()">Test</button>
+  <button class="primary" onclick="camSave()">Save</button>
+  <button onclick="document.getElementById('webcam').value='';camSave()">No phone camera</button>
+  <img class="preview" id="cam-phone" alt="" style="display:none">
+  <div class="msg" id="cam-msg"></div>
+</div>
+
+<div class="card" id="c-tpl">
+  <h2><span class="step-n">4</span>Slicing settings from your Flash Studio</h2>
+  <div class="dim" id="fs-line"></div>
+  <ol class="dim">
+    <li>Open Flash Studio on this PC with the Creator 5 Pro selected.</li>
+    <li>Set up all 4 filaments with the presets you print with (your own tuned presets if you have them).</li>
+    <li>Put any small model on the plate and click <b>Slice plate</b>.</li>
+    <li>Come back here and tap <b>Look for my latest slice</b>.</li>
+  </ol>
+  <div class="dim">The hub copies that file and slices every STL with exactly those settings. It checks every slice against it before anything is sent. Do this again whenever you change a preset in Flash Studio.</div>
+  <div id="tpl-now" style="margin-top:8px"></div>
+  <button onclick="tplLatest()">Look for my latest slice</button>
+  <button onclick="document.getElementById('tpl-file').click()">Upload a file instead</button>
+  <input type="file" id="tpl-file" accept=".3mf" style="display:none" onchange="tplUpload(this.files[0])">
+  <label class="check"><input type="checkbox" id="tpl-presets"> Only allow these filament presets (a file sliced on any other preset needs Send anyway)</label>
+  <div id="tpl-list"></div>
+  <div class="msg" id="tpl-msg"></div>
+</div>
+
+<div class="card" id="watcher">
+  <h2><span class="step-n">5</span>Failure watcher (optional)</h2>
+  <div class="dim">During a print, Claude looks at one camera frame every few minutes and pauses the print on a clear failure (spaghetti, a part knocked loose). It is off unless you set it up. It costs a small amount per check, billed to you. The drying bed check uses it too; without it you check the bed by eye.</div>
+  <label class="check"><input type="radio" name="wb" value=""> Off</label>
+  <label class="check"><input type="radio" name="wb" value="api"> My own Anthropic API key</label>
+  <div id="wb-key" style="display:none;padding-left:32px">
+    <input type="password" id="apikey" placeholder="sk-ant-..." autocomplete="off">
+    <div class="dim" id="key-line">Make a key at console.anthropic.com. It is saved in config.json on this PC only.</div>
+    <label class="check"><input type="checkbox" id="forget"> Forget the saved key</label>
+  </div>
+  <label class="check"><input type="radio" name="wb" value="cli"> Claude Code on this PC (signed in)</label>
+  <div class="dim" id="cli-line" style="padding-left:32px"></div>
+  <label class="check"><input type="checkbox" id="w-on"> Watch every print</label>
+  <button class="primary" onclick="saveWatcher()">Save</button>
+  <button onclick="testWatcher()">Test on the printer camera</button>
+  <div class="msg" id="w-msg"></div>
+</div>
+
+<div class="card" id="c-done">
+  <h2><span class="step-n">6</span>Open it on your phone</h2>
+  <div class="dim">With the phone on the same Wi-Fi, open:</div>
+  <div id="urls" style="font-size:18px;font-weight:600;margin:6px 0"></div>
+  <div class="dim">Windows asks once whether to allow Python on networks: choose <b>Private networks</b> only.</div>
+  <div class="warnbox">Keep it on your own network. Never forward this port on your router or put the hub on the open internet: anyone who reaches it can heat and move your printer. For outside access use Tailscale (see the README).</div>
+  <button class="go" style="margin-top:10px" onclick="finish()">Done - open the hub</button>
+  <div class="msg" id="done-msg"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let ST = {};
+async function api(path, opts={}){
+  const r = await fetch(path, opts);
+  if (r.status === 401) { location.href = "/"; throw new Error("login"); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const post = (p, b) => api(p, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(b || {})});
+const say = (id, text, cls) => { $(id).innerHTML = text ? `<span class="${cls || ""}">${esc(text)}</span>` : ""; };
+const done = (id, yes) => $(id).classList.toggle("done", !!yes);
+
+async function load(){
+  ST = await api("/api/setup");
+  const p = ST.printer;
+  if (!$("ip").value) $("ip").value = p.ip || "";
+  say("printer-msg", p.online ? `Connected - printer ${p.status}` : (p.ip ? p.error : ""), p.online ? "ok" : /^checking|starting/.test(p.error || "") ? "" : "bad");
+  done("c-printer", p.online);
+  done("c-pin", ST.pin_set);
+  if (ST.pin_set && !$("pin-msg").textContent) say("pin-msg", "PIN set", "ok");
+  if (!$("webcam").value) $("webcam").value = ST.webcam_url || "";
+  done("c-cam", p.online);
+  const fs = ST.flash_studio;
+  $("fs-line").innerHTML = fs.found ? `<span class="ok">Flash Studio found</span> <span class="dim">${esc(fs.path)}</span>`
+    : `<span class="bad">Flash Studio not found</span> at ${esc(fs.path)}. Install Flash Studio from Flashforge, or set "flash_studio" in config.json. Sliced files from elsewhere still upload and print without it.`;
+  const t = ST.template;
+  $("tpl-now").innerHTML = t ? (t.problems && t.problems.length ? `<span class="bad">Template has problems: ${esc(t.problems.join("; "))}</span>`
+    : `<span class="ok">Template in use:</span> ${esc(t.printer)}, ${esc((t.filaments || []).join(" / "))} <span class="dim">(${esc(t.slicer)}, ${esc(t.time)})</span>`)
+    : `<span class="warn">No template yet: STL slicing is off until you add one.</span>`;
+  done("c-tpl", t && !(t.problems || []).length);
+  const w = ST.watcher;
+  document.querySelectorAll("input[name=wb]").forEach(r => { if (!r._set) { r.checked = r.value === (w.chosen || ""); r._set = 1; } r.onchange = wbShow; });
+  if (!$("w-on")._set) { $("w-on").checked = w.enabled; $("w-on")._set = 1; }
+  $("key-line").textContent = w.key_end ? `Key saved, ends in ...${w.key_end}. Leave the box empty to keep it.` : "Make a key at console.anthropic.com. It is saved in config.json on this PC only.";
+  $("cli-line").textContent = w.claude_cli ? "Claude Code found on this PC." : "Claude Code not found on this PC.";
+  wbShow();
+  done("watcher", true);
+  $("urls").innerHTML = (ST.lan_urls || []).map(u => esc(u)).join("<br>") || "this PC's address, port " + ST.port;
+  done("c-done", ST.setup_done);
+}
+function wbShow(){ const v = (document.querySelector("input[name=wb]:checked") || {}).value; $("wb-key").style.display = v === "api" ? "" : "none"; }
+
+async function findPrinter(){
+  $("b-find").disabled = true; say("find-msg", " looking on your network...");
+  try {
+    let s = await post("/api/setup/scan", {});
+    while (s.running) { await new Promise(r => setTimeout(r, 1000)); s = (await api("/api/setup")).scan; say("find-msg", ` looking... ${s.done}/${s.total}`); }
+    say("find-msg", s.found.length ? ` found ${s.found.length}` : " nothing answered on port 8898. Is LAN Only on? Type the address from the printer screen instead.", s.found.length ? "ok" : "warn");
+    $("found").innerHTML = s.found.map(f => `<div class="found"><img src="/api/setup/camera.jpg?url=${encodeURIComponent("http://" + f.ip + ":8080/?action=stream")}" alt="">
+      <div style="flex:1"><b>${esc(f.ip)}</b> ${esc(f.name)}<div class="dim">${esc(f.reply)}</div></div>
+      <button onclick="$('ip').value='${esc(f.ip)}'">Use</button></div>`).join("");
+  } catch (e) { say("find-msg", " " + e.message, "bad"); }
+  $("b-find").disabled = false;
+}
+async function savePrinter(){
+  say("printer-msg", "Testing...");
+  try { const r = await post("/api/setup/printer", {ip:$("ip").value, serial:$("serial").value, check_code:$("check").value});
+    say("printer-msg", `Connected - printer ${r.status}`, "ok"); load(); }
+  catch (e) { say("printer-msg", e.message, "bad"); }
+}
+async function savePin(){
+  try { await post("/api/setup/pin", {pin:$("pin").value}); $("pin").value = ""; say("pin-msg", "PIN saved", "ok"); load(); }
+  catch (e) { say("pin-msg", e.message, "bad"); }
+}
+function camPrinter(){
+  const img = $("cam-printer"); say("cam-printer-msg", "Waiting for a picture (the printer camera can take 15 s to wake)...");
+  img.onload = () => { img.style.display = ""; say("cam-printer-msg", "Printer camera works", "ok"); };
+  img.onerror = () => { img.style.display = "none"; say("cam-printer-msg", "Printer camera not answering. Connect the printer in step 1 first.", "bad"); };
+  img.src = "/api/setup/camera.jpg?which=printer&t=" + Date.now();
+}
+function camTest(){
+  const u = $("webcam").value.trim(), img = $("cam-phone");
+  if (!u) return say("cam-msg", "Type the address the camera app shows", "bad");
+  say("cam-msg", "Waiting for a picture...");
+  img.onload = () => { img.style.display = ""; say("cam-msg", "Phone camera works - tap Save", "ok"); };
+  img.onerror = async () => { img.style.display = "none";
+    const r = await fetch("/api/setup/camera.jpg?url=" + encodeURIComponent(u)); const j = await r.json().catch(() => ({}));
+    say("cam-msg", (j.error === "camera not answering" ? "No picture from that address. Is the app running and its server started, with the phone on the same Wi-Fi?" : j.error) || "No picture", "bad"); };
+  img.src = "/api/setup/camera.jpg?url=" + encodeURIComponent(u) + "&t=" + Date.now();
+}
+async function camSave(){
+  say("cam-msg", "Saving...");
+  try { const r = await post("/api/setup/camera", {url:$("webcam").value.trim()}); say("cam-msg", r.stream ? "Phone camera saved: " + r.stream : "Printer camera only", "ok"); }
+  catch (e) { say("cam-msg", e.message, "bad"); }
+}
+function tplRow(f){
+  const bad = (f.problems || []).length;
+  return `<div class="found"><div style="flex:1"><b>${esc(f.printer || f.file)}</b> <span class="dim">${esc(f.time || "")}</span>
+    <div class="dim">${esc((f.filaments || []).join(" / "))} - ${esc(f.process || "")}</div>
+    ${bad ? `<div class="bad">${esc(f.problems.join("; "))}</div>` : ""}</div>
+    ${bad ? "" : `<button class="primary" onclick="tplUse('${esc(f.file)}')">Use this</button>`}</div>`;
+}
+async function tplLatest(){
+  say("tpl-msg", "Looking...");
+  try { const r = await api("/api/setup/template/latest");
+    $("tpl-list").innerHTML = r.files.map(tplRow).join("");
+    say("tpl-msg", r.files.length ? "Newest first. Pick the one you just sliced." : `No Flash Studio slices found in ${r.folder}. Slice a plate in Flash Studio, then look again.`, r.files.length ? "" : "warn");
+  } catch (e) { say("tpl-msg", e.message, "bad"); }
+}
+async function tplUse(file){
+  try { const r = await post("/api/setup/template/use", {file, only_these_presets:$("tpl-presets").checked});
+    say("tpl-msg", "Template saved: " + (r.filaments || []).join(" / "), "ok"); $("tpl-list").innerHTML = ""; load(); }
+  catch (e) { say("tpl-msg", e.message, "bad"); }
+}
+async function tplUpload(f){
+  if (!f) return; say("tpl-msg", "Uploading...");
+  try { const r = await api("/api/setup/template/upload?only_these_presets=" + ($("tpl-presets").checked ? 1 : 0), {method:"POST", body:f});
+    say("tpl-msg", "Template saved: " + (r.filaments || []).join(" / "), "ok"); load(); }
+  catch (e) { say("tpl-msg", e.message, "bad"); }
+  $("tpl-file").value = "";
+}
+async function saveWatcher(){
+  const b = (document.querySelector("input[name=wb]:checked") || {}).value || "";
+  try { const r = await post("/api/setup/watcher", {backend:b, api_key:$("apikey").value, forget_key:$("forget").checked, enabled:$("w-on").checked});
+    $("apikey").value = ""; $("forget").checked = false;
+    say("w-msg", r.backend ? `Saved - watcher ${r.enabled ? "on" : "off"}` : "Watcher off", "ok"); load(); }
+  catch (e) { say("w-msg", e.message, "bad"); }
+}
+async function testWatcher(){
+  say("w-msg", "Asking Claude about one printer camera frame...");
+  try { const v = await post("/api/setup/watcher/test", {});
+    say("w-msg", v.verdict === "error" ? "Test failed: " + v.reason : `Works: ${v.verdict} - ${v.reason}${v.cost != null ? ` (US$${(+v.cost).toFixed(4)})` : ""}`, v.verdict === "error" ? "bad" : "ok"); }
+  catch (e) { say("w-msg", e.message, "bad"); }
+}
+async function finish(){
+  try { await post("/api/setup/done", {}); location.href = "/"; }
+  catch (e) { say("done-msg", e.message, "bad"); }
+}
+load().catch(e => say("printer-msg", e.message, "bad"));
+</script>
+</body>
+</html>

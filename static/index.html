@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14161a">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg">
+<title>C5 Print Hub</title>
+<style>
+:root { --bg:#14161a; --card:#1f2228; --line:#2e323a; --text:#eef0f3; --dim:#9aa1ac; --go:#2fbf71; --warn:#f0b429; --stop:#e5484d; --accent:#3d8bfd; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; padding:12px 12px 80px; max-width:720px; margin-inline:auto; }
+h2 { font-size:14px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:20px 4px 8px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:10px; }
+.row { display:flex; gap:8px; align-items:center; }
+.grow { flex:1; min-width:0; }
+.ell { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pill { display:inline-block; padding:3px 10px; border-radius:99px; font-size:13px; font-weight:600; background:var(--line); white-space:nowrap; }
+.pill.go { background:#173d2a; color:#7ee2a8; } .pill.warn { background:#3d3215; color:#f5cf6b; } .pill.stop { background:#40191b; color:#ff9b9e; }
+.bar { height:8px; background:var(--line); border-radius:99px; overflow:hidden; margin:8px 0; }
+.bar > div { height:100%; background:var(--go); width:0; transition:width .5s; }
+.dim { color:var(--dim); font-size:14px; }
+.pct { font-size:34px; font-weight:800; line-height:1; }
+button, .btn { font:inherit; font-weight:600; border:0; border-radius:12px; padding:12px 16px; background:var(--line); color:var(--text); cursor:pointer; min-height:48px; }
+button:disabled { opacity:.4; }
+.primary { background:var(--accent); } .go-btn { background:var(--go); color:#06210f; } .danger { background:var(--stop); }
+.big { width:100%; font-size:18px; padding:16px; }
+.pair { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
+.link { background:none; padding:6px 0; min-height:0; color:var(--accent); font-size:14px; }
+.camwrap { position:relative; margin-bottom:10px; }
+.cam { width:100%; border-radius:14px; background:#000; aspect-ratio:4/3; object-fit:contain; display:block; }
+.camwrap .over { position:absolute; top:8px; right:8px; display:flex; gap:6px; }
+.over button { min-height:40px; padding:8px 12px; font-size:14px; background:#000b; }
+.over button.on { background:#f5cf6b; color:#000; }
+.camoff { display:none; padding:14px; }
+.camwrap.fs { position:fixed; inset:0; z-index:30; margin:0; background:#000; overflow:hidden; touch-action:none; }
+.camwrap.fs .cam { width:100%; height:100%; aspect-ratio:auto !important; border-radius:0; transform-origin:0 0; touch-action:none; }
+.camwrap.fs .over { top:max(8px, env(safe-area-inset-top)); z-index:1; }
+.tools { display:flex; gap:6px; }
+.tool { width:44px; height:44px; border-radius:10px; border:3px solid transparent; font-weight:800; color:#000; padding:0; min-height:0; }
+.tool.on { border-color:var(--text); box-shadow:0 0 0 2px var(--bg) inset; }
+.part { padding:8px 0; border-top:1px solid var(--line); }
+.thumb { width:76px; height:76px; border-radius:10px; background:#1c1e22; object-fit:contain; flex:none; }
+.job .top { align-items:flex-start; }
+.reasons { color:#ff9b9e; font-size:14px; margin:8px 0 0; padding-left:18px; }
+select { font:inherit; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:10px; }
+details { margin-top:10px; border-top:1px solid var(--line); }
+summary { padding:12px 0 4px; color:var(--dim); font-size:15px; cursor:pointer; }
+.set-g { margin-top:14px; } .set-g b { display:block; margin-bottom:2px; color:var(--text); font-size:16px; }
+.set-r { display:flex; gap:12px; padding:7px 0; border-top:1px solid var(--line); font-size:15px; }
+.set-r > span:first-child { color:var(--dim); flex:none; max-width:55%; }
+.set-r > span:last-child { margin-left:auto; min-width:0; text-align:right; font-weight:600; color:var(--text); overflow-wrap:anywhere; }
+#set-all .set-r { font-size:13px; } #set-all .set-r > span:last-child { font-weight:400; }
+.preview { width:100%; max-height:60vh; object-fit:contain; background:#1c1e22; border-radius:10px; }
+.sheet { position:fixed; inset:0; background:#000a; display:none; align-items:flex-end; z-index:9; }
+.sheet.open { display:flex; }
+.sheet .card { width:100%; max-width:720px; margin:0 auto; border-radius:18px 18px 0 0; padding:20px 16px 28px; max-height:92vh; overflow:auto; }
+label.check { display:flex; gap:12px; align-items:center; padding:12px 0; font-size:17px; }
+label.check input { width:26px; height:26px; }
+#toast { position:fixed; left:12px; right:12px; bottom:16px; background:#000; border:1px solid var(--line); border-radius:12px; padding:14px; display:none; z-index:10; }
+pre { white-space:pre-wrap; font-size:12px; color:var(--dim); max-height:60vh; overflow:auto; }
+.swatch { display:inline-block; width:14px; height:14px; border-radius:4px; vertical-align:-2px; border:1px solid #0006; }
+.alert { background:#40191b; border-radius:12px; padding:12px; margin-top:12px; }
+.adj { display:flex; gap:6px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+.adj .lab { flex:1; min-width:0; }
+.adj input { width:64px; font:inherit; font-weight:700; text-align:center; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:10px 4px; }
+.adj button { min-width:44px; padding:10px; }
+.dry { background:#3d3215; border-radius:12px; padding:12px; margin-top:12px; }
+.dry img { width:100%; border-radius:10px; margin-top:8px; }
+.presets { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:10px 0; }
+.presets button.on { background:var(--accent); } .presets button.on .dim { color:#dbe7ff; }
+.v3d { position:fixed; inset:0; z-index:20; background:#4a505a; display:none; overscroll-behavior:none; }
+.v3d.open { display:block; }
+.v3d-canvas { position:absolute; inset:0; }
+.v3d-canvas canvas { display:block; touch-action:none; }
+.v3d-top, .v3d-bottom { position:absolute; left:0; right:0; display:flex; gap:8px; align-items:center; padding:10px 12px; pointer-events:none; }
+.v3d-top { top:0; padding-top:max(10px, env(safe-area-inset-top)); background:linear-gradient(#000a, #0000); }
+.v3d-bottom { bottom:0; padding-bottom:max(12px, env(safe-area-inset-bottom)); background:linear-gradient(#0000, #000a); }
+.v3d-top > *, .v3d-bottom > * { pointer-events:auto; }
+.v3d button { background:#000b; min-height:44px; padding:10px 16px; }
+.v3d-load { position:absolute; left:16px; right:16px; top:40%; max-width:420px; margin:0 auto; background:#000c; border-radius:14px; padding:14px; text-align:center; }
+</style>
+</head>
+<body>
+
+<div class="card" id="status">
+  <div class="row"><span class="pill" id="st-pill">...</span><span class="grow ell dim" id="st-file" onclick="if ($('st-job').style.display !== 'none') openSettings()"></span></div>
+  <div id="st-job" style="display:none;margin-top:12px" onclick="openSettings()">
+    <div class="row" style="align-items:baseline"><span class="pct" id="st-pct"></span><span class="grow"></span><b id="st-left"></b></div>
+    <div class="bar"><div id="st-bar"></div></div>
+  </div>
+  <div class="dim" id="st-line"></div>
+  <div class="pair" id="controls">
+    <button id="b-pause" onclick="ctl(paused ? 'resume' : 'pause')">Pause</button>
+    <button id="b-cancel" class="danger" onclick="ctl('cancel')">Cancel</button>
+  </div>
+  <button class="link" id="b-adj" style="display:none" onclick="openAdj()">Temperatures and speed</button>
+  <button class="link" id="b-set" style="display:none;margin-left:16px" onclick="openSettings()">Settings sent</button>
+  <button class="link" id="b-dry" style="display:none;margin-left:16px" onclick="openDry()">Dry filament</button>
+  <div class="dry" id="dry" style="display:none">
+    <div id="dry-msg" style="font-weight:600"></div>
+    <div class="dim" id="dry-line" style="color:#f5cf6b"></div>
+    <div id="dry-check"></div>
+    <button class="big" id="dry-stop" style="margin-top:10px" onclick="dryAct('stop')">Stop drying</button>
+    <label class="check" id="dry-out-row"><input type="checkbox" id="dry-out"> Everything is out - every spool and the silica</label>
+    <button class="go-btn big" id="dry-bed" onclick="dryAct('check')">Check bed with the camera</button>
+    <div id="dry-more-row" style="margin-top:12px">
+      <div class="adj"><span class="lab"><b>Keep drying</b> - spools still on the bed</span><input id="dry-more-h" type="number" inputmode="decimal" step="0.5"><span class="dim">h</span></div>
+      <button class="big" id="dry-more" onclick="dryMore()">Keep drying</button>
+    </div>
+    <button class="link" id="dry-unlock" onclick="dryUnlock()">Camera not working? I checked the bed myself - unlock</button>
+  </div>
+  <div class="alert" id="w-event" style="display:none">
+    <div id="w-msg" style="font-weight:600"></div>
+    <img id="w-img" class="preview" style="margin-top:8px" alt="frame the watcher saw">
+    <div class="pair"><button class="go-btn" onclick="ctl('resume')">Resume (false alarm)</button>
+      <button class="danger" onclick="ctl('cancel')">Cancel print</button></div>
+    <button class="link" onclick="dismissWatch()">Hide this</button>
+  </div>
+</div>
+
+<div class="camwrap" id="camwrap">
+  <img id="cam" class="cam" alt="camera" onclick="if (!camFs) toggleCam()">
+  <div class="over"><button id="b-light" onclick="ctl(lightOn ? 'light_off' : 'light_on')">Light</button>
+    <button id="cam-src" onclick="switchCam()" style="display:none">Printer cam</button>
+    <button id="cam-btn" onclick="toggleCam()">Pause video</button>
+    <button id="cam-fs" onclick="camFull(!camFs)">Full screen</button></div>
+</div>
+<div class="card camoff row" id="camoff"><span class="grow dim" id="cam-note">Camera not answering, retrying</span>
+  <button class="link" id="cam-src2" onclick="switchCam()" style="display:none">Switch camera</button></div>
+
+<div class="row dim" style="padding:0 4px"><span class="grow" id="w-line">Failure watcher</span><button class="link" id="w-btn" onclick="toggleWatch()">Turn off</button><a class="link" href="/setup" style="margin-left:16px">Setup</a></div>
+
+<h2>Prints</h2>
+<label class="btn primary big" style="display:block;text-align:center">
+  + New print
+  <input type="file" id="file" multiple accept=".stl,.gcode,.3mf" style="display:none" onchange="upload(this.files)">
+</label>
+<div class="dim" style="text-align:center;margin-top:6px">STL to slice here, or a sliced G-code / 3MF from Flash Studio</div>
+<div id="jobs" style="margin-top:12px"></div>
+
+<div class="sheet" id="sheet" onclick="if(event.target===this)closeSheet()">
+  <div class="card">
+    <h3 style="margin:0 0 6px" id="sh-title">Send to printer</h3>
+    <div class="dim" id="sh-info"></div>
+    <div id="sh-slots" style="margin:10px 0"></div>
+    <label class="check"><input type="checkbox" id="sh-clear"> Plate is clear</label>
+    <label class="check"><input type="checkbox" id="sh-level" onchange="sheetJob && sheetInfo()"> Level the bed first</label>
+    <label class="check" id="sh-unchecked-row" style="display:none"><input type="checkbox" id="sh-unchecked"> <span id="sh-unchecked-text"></span></label>
+    <button class="go-btn big" id="sh-go" onclick="sendJob()">Start print</button>
+    <button class="big" style="margin-top:8px" onclick="closeSheet()">Back</button>
+  </div>
+</div>
+<div class="sheet" id="adj" onclick="if(event.target===this)closeAdj()">
+  <div class="card">
+    <h3 style="margin:0 0 6px">Temperatures and speed</h3>
+    <div class="dim" id="adj-note"></div>
+    <div id="adj-rows"></div>
+    <button class="big" style="margin-top:12px" onclick="closeAdj()">Close</button>
+  </div>
+</div>
+<div class="sheet" id="drysheet" onclick="if(event.target===this)closeDry()">
+  <div class="card">
+    <h3 style="margin:0 0 6px">Dry filament</h3>
+    <div class="dim">The hub holds the bed and chamber heat and locks printing until a camera check (or you, by eye) shows the bed is empty again. It never moves the printer.</div>
+    <div class="presets" id="dry-presets"></div>
+    <div class="adj"><span class="lab"><b>Bed</b></span><input id="dry-bed-t" type="number" inputmode="numeric"><span class="dim">°</span></div>
+    <div class="adj"><span class="lab"><b>Chamber</b></span><input id="dry-ch-t" type="number" inputmode="numeric"><span class="dim">°</span></div>
+    <div class="adj"><span class="lab"><b>Hours</b></span><input id="dry-h" type="number" inputmode="decimal" step="0.5"></div>
+    <div class="dim" id="dry-loaded" style="color:#f5cf6b"></div>
+    <div style="margin-top:8px"><b>On the printer screen, before the spools go in:</b></div>
+    <label class="check"><input type="checkbox" id="dc-parked"> Toolhead parked in a back corner</label>
+    <label class="check"><input type="checkbox" id="dc-bed_down"> Bed lowered to the bottom</label>
+    <label class="check"><input type="checkbox" id="dc-spools"> Spools on the bed (after parking - no jogging now, it homes first)</label>
+    <label class="check"><input type="checkbox" id="dc-door"> Door shut</label>
+    <button class="go-btn big" id="dry-go" onclick="startDry()">Start drying</button>
+    <button class="big" style="margin-top:8px" onclick="closeDry()">Back</button>
+  </div>
+</div>
+<div class="v3d" id="v3d">
+  <div class="v3d-canvas" id="v3d-canvas"></div>
+  <div class="v3d-top"><b class="grow ell" id="v3d-title"></b><button onclick="close3d()">Close</button></div>
+  <div class="v3d-load" id="v3d-load"><div id="v3d-msg"></div><div class="bar"><div id="v3d-bar"></div></div></div>
+  <div class="v3d-bottom"><span class="grow dim" id="v3d-note"></span><button onclick="V3D && V3D.reset()">Reset view</button></div>
+</div>
+<div id="toast"></div>
+
+<script>
+let S = {printer:{online:false}}, colours = ["#FFFFFF","#1E5BD8","#F5D000","#FF69B4"], lightOn = false, camOn = true, paused = false, sheetJob = null, jobsCache = [];
+const openParts = new Set();
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function toast(msg, ms=3500){ const t=$("toast"); t.textContent=msg; t.style.display="block"; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none", ms); }
+async function api(path, opts={}){
+  const r = await fetch(path, opts); if (r.status===401) { location.reload(); throw new Error("login"); }
+  const j = await r.json().catch(()=>({})); if (!r.ok) throw new Error(j.error || (j.reply && JSON.stringify(j.reply)) || r.statusText); return j;
+}
+const post = (path, body) => api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body||{})});
+const hms = s => { s=+s||0; const h=Math.floor(s/3600), m=Math.round(s%3600/60); return h ? `${h}h ${m}m` : `${m}m`; };
+const shortTime = t => String(t||"").replace(/(\d+h \d+m) \d+s/, "$1");
+function slotColours(){ const sl = S.printer.slots||[]; return [1,2,3,4].map(i => (sl.find(x=>x.slot==i)||{}).colour || colours[i-1]); }
+const sw = c => `<span class="swatch" style="background:${c}"></span>`;
+
+async function refresh(){
+  const hadWebcam = !!S.webcam;
+  try { S = await api("/api/status"); colours = S.colours; } catch(e){ return; }
+  if (!!S.webcam !== hadWebcam && camOn && !document.hidden && !$("v3d").classList.contains("open")) setCam(true);
+  const p = S.printer, st = (p.status||"offline").toLowerCase();
+  const printing = ["printing","heating"].includes(st);
+  paused = ["pause","paused","pausing"].includes(st);
+  const cls = !p.online ? "stop" : ["printing","heating","busy","calibrate_doing","downloading"].includes(st) ? "go" : paused || st==="error" ? "warn" : "";
+  $("st-pill").className = "pill " + cls; $("st-pill").textContent = p.online ? st : "not connected";
+  $("st-file").textContent = p.online ? (p.file || "") : "";
+  const job = p.online && p.file && (printing || paused);
+  $("st-job").style.display = job ? "block" : "none";
+  if (job){ $("st-pct").textContent = Math.round(p.progress||0) + "%"; $("st-bar").style.width = (p.progress||0) + "%";
+    const done = new Date(Date.now() + (p.left_s||0)*1000).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+    $("st-left").textContent = p.left_s ? `${hms(p.left_s)} left` + (paused ? "" : ` - done ${done}`)
+      + (p.eta_from === "start" ? " (heating and leveling now)" : "") : ""; }
+  const sc = slotColours();
+  // A heated chamber warms idle nozzles to about its own temperature, so "hot" is 10° over the chamber (else a
+  // nozzle sitting at 50 in a 65° drying chamber flickers in and out of the list).
+  const hotAt = Math.max(50, (p.chamber || 0) + 10);
+  const hot = (p.tools||[]).filter(t => (t.target||0) > 0 || (t.temp||0) >= hotAt).map(t => `${sw(sc[t.t-1])} T${t.t} ${t.temp}°`);
+  const err = p.error_code && p.error_code!=="0" && p.error_code!==0 ? ` - <b style="color:#ff9b9e">error ${esc(p.error_code)}</b>` : "";
+  $("st-line").innerHTML = !p.online
+    ? (/serial number|lan only|not set up/i.test(p.error||"") ? "C5 Print Hub can't talk to the printer yet: open <a href=\"/setup\" style=\"color:var(--accent)\">Setup</a> (needs LAN Only on the printer, its serial number and check code)." : esc(p.error||""))
+    : [job ? layerText(p) : "", `Bed ${p.bed}°`].concat(hot).filter(Boolean).join(" &nbsp;·&nbsp; ") + err;
+  $("controls").style.display = printing || paused ? "grid" : "none";
+  $("b-set").style.display = job ? "" : "none";
+  $("b-pause").textContent = paused ? "Resume" : "Pause"; $("b-pause").className = paused ? "go-btn" : "";
+  const D = S.drying || {phase:"off"}, dryLock = D.phase === "drying" || D.phase === "bedcheck";
+  $("b-adj").style.display = p.online && !dryLock ? "" : "none";
+  $("b-dry").style.display = p.online && D.phase === "off" && ["ready","completed","cancel"].includes(st) ? "" : "none";
+  showDrying(D, p);
+  if ($("adj").classList.contains("open")) adjLive();
+  lightOn = p.light === "open";
+  $("b-light").style.display = p.online ? "" : "none"; $("b-light").className = lightOn ? "on" : "";
+  const w = S.watch || {}, lv = w.last;
+  $("w-btn").textContent = !S.watch_ready ? "Set up" : w.enabled ? "Turn off" : "Turn on";
+  $("w-line").textContent = !S.watch_ready ? "Failure watcher not set up (optional)" : !w.enabled ? "Failure watcher off" : w.blind ? `Watcher can't check since ${w.blind.since}: ${w.blind.reason}` : lv ? `Watcher ${lv.time}: ${lv.verdict} - ${lv.reason}` : "Failure watcher on (checks while printing)";
+  $("w-line").style.color = w.enabled && w.blind ? "#f5cf6b" : "";
+  $("w-event").style.display = w.event ? "block" : "none";
+  if (w.event){ $("w-msg").textContent = `${w.event.time} ${w.event.message}`; if (w.event.image && !$("w-img").src.endsWith(w.event.image)) $("w-img").src = "/watch/" + w.event.image; }
+}
+
+async function ctl(a){
+  if (a==="cancel" && !confirm("Cancel the print? This cannot be undone.")) return;
+  if (a==="pause" && !confirm("Pause the print?")) return;
+  try { await post("/api/control", {action:a}); toast("Sent: " + a.replace("_"," ")); setTimeout(refresh, 1500); } catch(e){ toast("Failed: " + e.message, 6000); }
+}
+
+// Temperatures and speed. During a print the hub holds a change through tool changes (the file resets them).
+let adjBusy = false;
+function adjItems(){
+  const p = S.printer, sc = slotColours(), act = ["printing","heating","busy","pause","paused","pausing"].includes((p.status||"").toLowerCase());
+  const it = (p.tools||[]).map(t => ({item:`t${t.t}`, label:`${sw(sc[t.t-1])} T${t.t}`, now:t.temp, target:t.target, step:5, unit:"°"}));
+  it.push({item:"bed", label:"Bed", now:p.bed, target:p.bed_target, step:5, unit:"°"});
+  if (act) it.push({item:"speed", label:"Speed", now:null, target:p.speed, step:10, unit:"%"});
+  return it;
+}
+function openAdj(){
+  const act = ["printing","heating","busy","pause","paused","pausing"].includes((S.printer.status||"").toLowerCase());
+  $("adj-note").textContent = act ? "Changes hold for the rest of this print, through tool changes. A parked tool takes its new temperature at its next tool change." : "Nothing printing: sets the target now (0 = off).";
+  $("adj-rows").innerHTML = adjItems().map(x => `<div class="adj"><span class="lab"><b>${x.label}</b><br><span class="dim" id="adj-${x.item}-now"></span></span>
+    <button onclick="adjStep('${x.item}',-${x.step})">-${x.step}</button><input id="adj-${x.item}" type="number" inputmode="numeric" value="${(S.hold||{})[x.item] ?? Math.round(x.target||0)}">
+    <button onclick="adjStep('${x.item}',${x.step})">+${x.step}</button><button class="primary" onclick="adjSet('${x.item}')">Set</button></div>`).join("");
+  adjLive(); $("adj").classList.add("open");
+}
+function adjLive(){
+  const hold = S.hold || {};
+  for (const x of adjItems()){ const el = $(`adj-${x.item}-now`); if (!el) continue;
+    el.innerHTML = (x.now != null ? `now ${x.now}${x.unit}, ` : "") + `target ${Math.round(x.target||0)}${x.unit}` + (hold[x.item] != null ? ` - <b style="color:#7ee2a8">held ${hold[x.item]}${x.unit}</b>` : ""); }
+}
+function adjStep(item, d){ const el = $(`adj-${item}`); el.value = (+el.value||0) + d; }
+async function adjSet(item){
+  if (adjBusy) return; adjBusy = true; const v = +$(`adj-${item}`).value; toast(`Setting ${item.toUpperCase()} to ${v}...`, 15000);
+  try { const r = await post("/api/adjust", {item, value:v}); toast(r.note || `${item.toUpperCase()} ${v}` + (r.held ? " - held for this print" : ""), 6000); setTimeout(refresh, 500); }
+  catch(e){ toast("Not changed: " + e.message, 8000); }
+  adjBusy = false;
+}
+function closeAdj(){ $("adj").classList.remove("open"); }
+
+async function toggleWatch(){ if (!S.watch_ready) { location.href = "/setup#watcher"; return; } try { await post("/api/watch", {enabled: !(S.watch||{}).enabled}); refresh(); } catch(e){ toast(e.message); } }
+async function dismissWatch(){ await post("/api/watch", {dismiss:true}); refresh(); }
+// Two cameras when a phone webcam is set: the printer's own (front, 1.3 fps) and the phone (top-down, smoother).
+let camSrc = "webcam"; try { camSrc = localStorage.getItem("camSrc") || "webcam"; } catch(e){}
+let camFallback = false;  // phone cam picked but not answering: show the printer cam, look for the phone each minute
+const useWebcam = () => !!S.webcam && camSrc === "webcam" && !camFallback;
+function setCam(on){
+  camOn = on; const w = useWebcam();
+  $("cam").style.aspectRatio = w ? "16/9" : "4/3";
+  $("cam").src = on ? (w ? "/webcam.mjpg" : "/cam.mjpg") + "?t=" + Date.now() : "";
+  $("cam-btn").textContent = on ? "Pause video" : "Play video";
+  $("cam-src").textContent = w ? "Printer cam" : "Phone cam";
+  $("cam-src").style.display = $("cam-src2").style.display = S.webcam ? "" : "none";
+}
+function switchCam(){ camSrc = useWebcam() ? "printer" : "webcam"; camFallback = false; try { localStorage.setItem("camSrc", camSrc); } catch(e){} setCam(true); }
+function toggleCam(){ setCam(!camOn); }
+function camUp(up){ $("camwrap").style.display = up ? "" : "none"; $("camoff").style.display = up ? "none" : "flex"; }
+document.addEventListener("visibilitychange", () => { if (document.hidden) $("cam").src = ""; else if (camOn && !$("v3d").classList.contains("open")) setCam(true); });
+$("cam").onerror = () => { if (!camOn) return;
+  if (useWebcam()){ camFallback = true; toast("Phone cam not answering, showing printer cam"); return setCam(true); }
+  camUp(false); setTimeout(()=>camOn && setCam(true), 5000); };
+$("cam").onload = () => camUp(true);
+setInterval(async () => {
+  if (!camFallback || !camOn || document.hidden) return;
+  try { if ((await fetch("/webcam.jpg", {cache:"no-store"})).ok){ camFallback = false; setCam(true); } } catch(e){}
+}, 60000);
+
+async function upload(files){
+  let jid = null;
+  for (const f of files){
+    toast(`Uploading ${f.name}...`, 60000);
+    try {
+      const job = await api(`/api/upload?name=${encodeURIComponent(f.name)}${jid?"&job="+jid:""}`, {method:"POST", body:f});
+      if (job.kind === "model"){ jid = job.id; openParts.add(jid); }
+    } catch(e){ toast(`${f.name}: ${e.message}`, 8000); }
+  }
+  $("file").value = ""; toast("Uploaded"); loadJobs();
+}
+
+const stateText = {new:"Not sliced", queued:"Waiting", slicing:"Slicing...", ready:"Ready", blocked:"Blocked", failed:"Failed", sent:"Sent"};
+const statePill = {ready:"go", sent:"go", blocked:"stop", failed:"stop", slicing:"warn", queued:"warn"};
+
+function jobCard(j){
+  const sc = slotColours(), st = j.stats || {}, chk = j.check || {}, model = j.kind === "model";
+  const hasPrev = ["ready","blocked","sent"].includes(j.state);
+  const info = st.time ? `${esc(shortTime(st.time))} - ${Math.round(+st.grams||0)} g ` + (st.colours||[]).map(([i]) => sw(sc[i-1])).join(" ")
+    : model ? `${j.parts.length} part${j.parts.length===1?"":"s"}` : "";
+  let h = `<div class="card job"><div class="row top">` +
+    (hasPrev ? `<img class="thumb" src="/api/jobs/${j.id}/preview.png?${j.state}" alt="" onclick="show3d('${j.id}')">` : "") +
+    `<div class="grow"><div class="row"><b class="grow ell">${esc(j.name)}</b><span class="pill ${statePill[j.state]||""}">${stateText[j.state]||j.state}</span></div>
+     <div style="margin-top:4px">${info}</div>
+     <div class="dim">${esc(j.created)}${j.source==="claude"?" - from Claude":""}${j.engine==="forkaslicer"?" - ForkaSlicer":""}</div></div></div>`;
+  if (j.engine_note) h += `<div class="reasons">${esc(j.engine_note)}</div>`;
+  if (j.detail && j.fine && hasPrev) h += `<div class="dim" style="margin-top:6px">${detailText(j.fine)}</div>`;
+  if (chk.reasons && chk.reasons.length) h += `<ul class="reasons">${chk.reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul>`;
+  if (j.error) h += `<div class="reasons">${esc(j.error)}</div>`;
+  if (["ready","sent"].includes(j.state)) h += `<button class="go-btn big" style="margin-top:12px" onclick="openSheet('${j.id}')">${j.state==="sent"?"Print again":"Print"}</button>`;
+  else if (model && ["new","blocked","failed"].includes(j.state)) h += `<button class="primary big" style="margin-top:12px" onclick="sliceJob('${j.id}')">Slice</button>`;
+  if (j.state === "blocked") h += `<button class="big" style="margin-top:8px" onclick="openSheet('${j.id}')">Print anyway...</button>`;
+  if (model){
+    const open = openParts.has(j.id) || j.state === "new";
+    h += `<details ${open?"open":""} ontoggle="this.open ? openParts.add('${j.id}') : openParts.delete('${j.id}')"><summary>Colours and layer height</summary>`;
+    for (const [i, p] of j.parts.entries())
+      h += `<div class="part row"><span class="grow ell">${esc(p.name)}</span><div class="tools">` +
+        [1,2,3,4].map(t => `<button class="tool ${p.tool==t?"on":""}" style="background:${sc[t-1]}" onclick="setTool('${j.id}',${i},${t})">${t}</button>`).join("") + `</div></div>`;
+    h += `<div class="row part"><span class="grow">Layer height</span><select onchange="setLayer('${j.id}',this.value)">` +
+      ["0.12","0.16","0.2","0.24"].map(l => `<option ${String(j.layer)===l?"selected":""} value="${l}">${l} mm${l==="0.2"?" (standard)":""}</option>`).join("") +
+      `</select></div><label class="check part"><input type="checkbox" ${j.detail?"checked":""} onchange="setDetail('${j.id}',this.checked)"> Detail - finer layers only where slopes and curves would show steps</label>` +
+      `<div class="row"><label class="btn link">+ Add a part<input type="file" multiple accept=".stl" style="display:none" onchange="addParts('${j.id}',this.files)"></label></div></details>`;
+  }
+  h += `<div class="row" style="margin-top:4px">` +
+    (model && ["ready","blocked","failed"].includes(j.state) ? `<button class="link" onclick="showText('${j.id}','verify.txt')">${chk.passed ? "Check passed - details" : "Check details"}</button>` : "") +
+    `<span class="grow"></span><button class="link" style="color:var(--dim)" onclick="delJob('${j.id}')">Delete</button></div></div>`;
+  return h;
+}
+
+async function loadJobs(){
+  try { jobsCache = await api("/api/jobs"); } catch(e){ return; }
+  $("jobs").innerHTML = jobsCache.length ? jobsCache.map(jobCard).join("") : `<div class="dim card">No prints yet. Tap New print and pick a file.</div>`;
+}
+async function setTool(id,i,t){ const tools={}; tools[i]=t; try { await post(`/api/jobs/${id}/update`, {tools}); loadJobs(); } catch(e){ toast(e.message); } }
+// The file's own layer and height where the printer is (the printer's layer number bounces at tool changes).
+function layerText(p){
+  if (!p.file_layer) return `Layer ${p.layer}/${p.layers}`;
+  const mm = p.z != null && p.z_top ? ` &nbsp;·&nbsp; ${p.z.toFixed(1)} of ${p.z_top.toFixed(1)} mm` : "";
+  return `Layer ${p.file_layer}/${p.file_layers}${mm}`;
+}
+// Detail result against a standard slice of the same model: how much smaller the steps on slopes are, and the time.
+function detailText(f){
+  if (!f.fine_mm || !f.applied) return "Detail: no slopes or curves that gain from finer layers - standard slice";
+  const better = f.plain_step && f.step ? Math.round(100 * (1 - f.step / f.plain_step)) : null;
+  const t = s => { const m = /(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?/.exec(s||""); return m ? (+m[1]||0)*3600 + (+m[2]||0)*60 + (+m[3]||0) : 0; };
+  const extra = f.plain_time && f.time ? Math.round(100 * (t(f.time) / t(f.plain_time) - 1)) : null;
+  return `Detail: steps on slopes ${better != null ? better + "% smaller" : "smaller"}` +
+    (extra != null ? `, ${esc(shortTime(f.time))} vs ${esc(shortTime(f.plain_time))} standard (+${extra}%)` : "");
+}
+async function setDetail(id,on){ try { await post(`/api/jobs/${id}/update`, {detail:on}); loadJobs(); } catch(e){ toast(e.message); } }
+async function setLayer(id,l){ try { await post(`/api/jobs/${id}/update`, {layer:l}); loadJobs(); } catch(e){ toast(e.message); } }
+async function addParts(id, files){ for (const f of files){ try { await api(`/api/upload?job=${id}&name=${encodeURIComponent(f.name)}`, {method:"POST", body:f}); } catch(e){ toast(e.message, 6000); } } loadJobs(); }
+async function sliceJob(id){ try { await post(`/api/jobs/${id}/slice`); toast("Slicing"); loadJobs(); } catch(e){ toast(e.message, 6000); } }
+async function delJob(id){ if (!confirm("Delete this print from the list?")) return; await post(`/api/jobs/${id}/delete`); loadJobs(); }
+async function showText(id, f){ const r = await fetch(`/api/jobs/${id}/${f}`); const t = await r.text(); openSheetRaw("Check details", `<pre>${esc(t)}</pre>`); }
+function showPreview(id){ const j = jobsCache.find(x=>x.id===id); openSheetRaw(j.name, `<img class="preview" src="/api/jobs/${id}/preview.png?${j.state}" alt="preview">`); }
+
+// 3D spin viewer (static/viewer3d.js + vendored three.js), loaded on the first tap. The camera video pauses while
+// it is open so the model gets the bandwidth; the phone's Back button closes it.
+let V3D = null;
+async function show3d(id){
+  const j = jobsCache.find(x=>x.id===id); if (!j) return;
+  try { V3D = V3D || await import("/static/viewer3d.js"); } catch(e){ toast("3D viewer did not load: " + e.message, 6000); return; }
+  $("cam").removeAttribute("src"); history.pushState({v3d:1}, ""); V3D.open(j, slotColours());
+}
+function close3d(){ if (history.state && history.state.v3d) history.back(); else shut3d(); }
+function shut3d(){ if (V3D) V3D.close(); if (camOn && !document.hidden) setCam(true); }
+addEventListener("popstate", () => { if ($("v3d").classList.contains("open")) shut3d(); if (camFs) camFull(false, true); });
+
+// Full screen camera with pinch / wheel zoom, drag to pan, double tap for 1x / 3x. Back or Close leaves it.
+let camFs = false, zs = 1, zx = 0, zy = 0, lastTap = 0;
+const ptrs = new Map();
+function zoomApply(){
+  zs = Math.min(6, Math.max(1, zs));
+  const r = $("camwrap").getBoundingClientRect(), w = r.width, h = r.height;  // the image fills the full screen box
+  zx = Math.min(0, Math.max(w - w * zs, zx)); zy = Math.min(0, Math.max(h - h * zs, zy));
+  $("cam").style.transform = zs > 1 ? `translate(${zx}px,${zy}px) scale(${zs})` : "";
+}
+function zoomAt(px, py, s){  // px, py: point on the camera box that stays put
+  s = Math.min(6, Math.max(1, s));
+  zx = px - (px - zx) * s / zs; zy = py - (py - zy) * s / zs; zs = s; zoomApply();
+}
+function camFull(on, fromBack){
+  camFs = on; zs = 1; zx = zy = 0; zoomApply(); ptrs.clear();
+  $("camwrap").classList.toggle("fs", on); $("cam-fs").textContent = on ? "Close" : "Full screen";
+  if (on){
+    history.pushState({camfs:1}, "");
+    try { $("camwrap").requestFullscreen && $("camwrap").requestFullscreen().catch(()=>{}); } catch(e){}
+    if (!camOn) setCam(true);
+  } else {
+    try { document.fullscreenElement && document.exitFullscreen(); } catch(e){}
+    if (!fromBack && history.state && history.state.camfs) history.back();
+  }
+}
+document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement && camFs) camFull(false); });
+const camBox = () => $("camwrap").getBoundingClientRect();
+$("cam").addEventListener("pointerdown", e => { if (!camFs) return; try { $("cam").setPointerCapture(e.pointerId); } catch(err){}
+  ptrs.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if (ptrs.size === 1){ const now = Date.now(), b = camBox();
+    if (now - lastTap < 300) zoomAt(e.clientX - b.left, e.clientY - b.top, zs > 1 ? 1 : 3);
+    lastTap = now; } });
+$("cam").addEventListener("pointermove", e => { if (!camFs || !ptrs.has(e.pointerId)) return;
+  const old = ptrs.get(e.pointerId), b = camBox();
+  if (ptrs.size === 1){ zx += e.clientX - old.x; zy += e.clientY - old.y; ptrs.set(e.pointerId, {x:e.clientX, y:e.clientY}); return zoomApply(); }
+  const [a, c] = [...ptrs.values()], other = a === old ? c : a;
+  const d0 = Math.hypot(old.x - other.x, old.y - other.y), d1 = Math.hypot(e.clientX - other.x, e.clientY - other.y);
+  ptrs.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if (d0 > 10) zoomAt((e.clientX + other.x) / 2 - b.left, (e.clientY + other.y) / 2 - b.top, zs * d1 / d0); });
+["pointerup", "pointercancel"].forEach(t => $("cam").addEventListener(t, e => ptrs.delete(e.pointerId)));
+$("cam").addEventListener("wheel", e => { if (!camFs) return; e.preventDefault(); const b = camBox();
+  zoomAt(e.clientX - b.left, e.clientY - b.top, zs * (e.deltaY < 0 ? 1.2 : 1 / 1.2)); }, {passive:false});
+addEventListener("keydown", e => { if (e.key === "Escape" && camFs) camFull(false); });
+
+function openSheetRaw(title, html){ $("sh-title").textContent = title; $("sh-info").innerHTML = html; $("sh-slots").innerHTML = "";
+  for (const id of ["sh-clear","sh-level","sh-go"]) $(id).closest("label,button").style.display = "none"; $("sh-unchecked-row").style.display="none"; $("sheet").classList.add("open"); }
+// Print time from the hub's model of the file plus the start (heating, and probing if leveling), so "done" is real.
+// What the printer was really given: the settings block inside the file this print was sent with.
+async function openSettings(){
+  openSheetRaw("Settings sent", `<div class="dim">Reading the file...</div>`);
+  let r; try { r = await api("/api/printing/settings"); } catch(e){ $("sh-info").innerHTML = `<div class="reasons">${esc(e.message)}</div>`; return; }
+  const rows = rs => rs.map(([k, v]) => `<div class="set-r"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
+  $("sh-title").textContent = "Settings sent - " + r.name;
+  $("sh-info").innerHTML = `<div class="dim">${esc(r.file)}</div>` + r.groups.map(g => `<div class="set-g"><b>${esc(g.name)}</b>${rows(g.rows)}</div>`).join("")
+    + (r.parts.length ? `<div class="set-g"><b>Per-part changes</b>` + r.parts.map(p => `<div class="dim" style="margin-top:6px">${esc(p.name)}</div>${rows(p.rows)}`).join("") + `</div>` : "")
+    + `<details><summary>All ${r.all.length} settings in the file</summary><input id="set-q" placeholder="Search settings" oninput="setFilter()" style="width:100%;font:inherit;margin:8px 0;padding:10px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px">`
+    + `<div id="set-all">${rows(r.all)}</div></details>`;
+}
+function setFilter(){ const q = $("set-q").value.trim().toLowerCase();
+  for (const el of $("set-all").children) el.style.display = !q || el.textContent.toLowerCase().includes(q) ? "" : "none"; }
+function sheetInfo(){
+  const j = sheetJob, st = j.stats||{}, e = j.est, p = S.printer;
+  let t = esc(shortTime(st.time));
+  if (e){ const start = $("sh-level").checked ? e.start_level_s : e.start_s;
+    const done = new Date(Date.now() + (start + e.print_s)*1000).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+    t = `${hms(e.print_s)} + ${Math.round(start/60)} min start - done about ${done}`; }
+  $("sh-info").innerHTML = `${t} - ${esc(st.grams||"?")} g` + (p.online ? ` - printer ${esc(p.status)}` : ` - <span style="color:#ff9b9e">printer not connected</span>`);
+}
+function openSheet(id){
+  const D = S.drying || {};
+  if (D.phase === "drying" || D.phase === "bedcheck") return toast(D.phase === "drying" ? "Drying mode is on - stop it and check the bed first" : "Check the bed first (drying just finished)", 6000);
+  const j = jobsCache.find(x=>x.id===id); sheetJob = j; const st = j.stats||{}, sc = slotColours(), p = S.printer;
+  for (const id of ["sh-clear","sh-level","sh-go"]) $(id).closest("label,button").style.display = "";
+  $("sh-title").textContent = "Print " + j.name;
+  sheetInfo();
+  $("sh-slots").innerHTML = (st.colours||[]).map(([i,c]) => { const s=(p.slots||[]).find(x=>x.slot==i)||{};
+    return `<div class="row" style="padding:4px 0">${sw(c)} T${i} prints from slot ${i}: ${sw(sc[i-1])} ${esc(s.material||"")} ${s.loaded===false?'<b style="color:#ff9b9e">empty</b>':""}</div>`; }).join("");
+  $("sh-clear").checked = false; $("sh-level").checked = !!S.leveling; sheetInfo();
+  showUnchecked(!(j.check||{}).passed ? (j.check||{}).reasons||[] : [], []);
+  $("sheet").classList.add("open");
+  api(`/api/jobs/${id}/precheck`).then(r => { if (sheetJob && sheetJob.id === id) { showUnchecked(r.check && !r.check.passed ? r.check.reasons||[] : [], r.problems||[]);
+    if ((r.notes||[]).length) $("sh-slots").innerHTML += `<div style="color:#f5cf6b;padding:4px 0">${esc(r.notes.join("; "))}</div>`; } }).catch(()=>{});
+}
+function showUnchecked(reasons, problems){
+  const all = problems.concat(reasons), show = all.length > 0;
+  $("sh-unchecked-row").style.display = show ? "flex" : "none"; $("sh-unchecked").checked = false;
+  $("sh-unchecked-text").innerHTML = show ? (problems.length ? `<b style="color:#ff9b9e">${esc(problems.join("; "))}</b><br>` : "") + `Send anyway (${esc(all.join("; "))})` : "";
+}
+function closeSheet(){ $("sheet").classList.remove("open"); }
+async function sendJob(){
+  if (!$("sh-clear").checked) return toast("Tick 'Plate is clear' first");
+  $("sh-go").disabled = true; toast("Sending to printer...", 60000);
+  try { await post(`/api/jobs/${sheetJob.id}/print`, {plate_clear:true, leveling:$("sh-level").checked, allow_unchecked:$("sh-unchecked").checked});
+    toast("Print started"); closeSheet(); loadJobs(); setTimeout(refresh, 2000);
+  } catch(e){ toast("Not sent: " + e.message, 10000); }
+  $("sh-go").disabled = false;
+}
+
+// Drying mode (dryer.py on the hub). Only the hub's own Print and temperature buttons are locked: the printer
+// screen and the Flashforge app can still start a print.
+let dryPreset = "petg";
+function openDry(){
+  const P = (S.drying||{}).presets || {};
+  $("dry-presets").innerHTML = Object.entries(P).map(([k,v]) => `<button id="dp-${k}" onclick="pickDry('${k}')">${esc(v.label)}<br><span class="dim">${v.bed}° / ${v.chamber}° / ${v.hours} h</span></button>`).join("");
+  for (const k of ["parked","bed_down","spools","door"]) $("dc-"+k).checked = false;
+  const loaded = (S.printer.slots||[]).filter(x=>x.loaded).map(x=>x.slot);
+  $("dry-loaded").textContent = loaded.length ? `Slot ${loaded.join(", ")} still loaded: the chamber is capped at 45° to protect the filament in the heads.` : "";
+  pickDry(dryPreset); $("drysheet").classList.add("open");
+}
+function pickDry(k){ dryPreset = k; const v = ((S.drying||{}).presets||{})[k]; if (!v) return;
+  for (const b of document.querySelectorAll("#dry-presets button")) b.className = b.id === "dp-"+k ? "on" : "";
+  $("dry-bed-t").value = v.bed; $("dry-ch-t").value = v.chamber; $("dry-h").value = v.hours; }
+function closeDry(){ $("drysheet").classList.remove("open"); }
+async function startDry(){
+  const confirm = {}; for (const k of ["parked","bed_down","spools","door"]) confirm[k] = $("dc-"+k).checked;
+  if (!Object.values(confirm).every(Boolean)) return toast("Tick all four first");
+  $("dry-go").disabled = true;
+  try { await post("/api/drying", {action:"start", preset:dryPreset, bed:$("dry-bed-t").value, chamber:$("dry-ch-t").value, hours:$("dry-h").value, confirm});
+    toast("Drying started"); closeDry(); setTimeout(refresh, 1000); }
+  catch(e){ toast("Not started: " + e.message, 8000); }
+  $("dry-go").disabled = false;
+}
+async function dryAct(a){
+  if (a === "stop" && !confirm("Stop drying and turn the heat off?")) return;
+  if (a === "check" && !$("dry-out").checked) return toast("Tick 'Everything is out' first");
+  if (a === "check") toast("Checking the bed - waiting 12 s for the cameras to catch up...", 60000);
+  try { const r = await post("/api/drying", {action:a, all_out: a === "check" && $("dry-out").checked}); toast(a === "check" ? (r.phase === "off" ? "Bed is empty - printing unlocked" : "Bed check did not pass - see the photo") : "Drying stopped", 6000); refresh(); }
+  catch(e){ toast(e.message, 8000); }
+}
+async function dryMore(){
+  const D = S.drying || {}, h = $("dry-more-h").value;
+  if (!confirm(`Keep drying ${D.label||""} ${h} h at bed ${D.bed}° / chamber ${D.chamber}°? Head still parked, spools still on the bed, door shut?`)) return;
+  $("dry-more").disabled = true;
+  try { await post("/api/drying", {action:"resume", hours:h, confirm:{parked:true, spools:true, door:true}}); toast("Drying continued", 6000); refresh(); }
+  catch(e){ toast(e.message, 8000); }
+  $("dry-more").disabled = false;
+}
+async function dryUnlock(){
+  if (!confirm("Only if the camera can't see the bed. Did you look at the bed yourself and it is completely empty?")) return;
+  try { await post("/api/drying", {action:"unlock", i_checked:true}); toast("Unlocked"); refresh(); } catch(e){ toast(e.message, 8000); }
+}
+function showDrying(D, p){
+  const on = D.phase === "drying" || D.phase === "bedcheck";
+  $("dry").style.display = on ? "block" : "none"; if (!on) return;
+  if (D.phase === "drying"){
+    const ends = new Date(D.end*1000).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+    $("dry-msg").textContent = `Drying ${D.label}: ${hms(D.left_s)} left, ends ${ends}`;
+    $("dry-line").textContent = `Bed ${p.bed}° of ${D.bed}° · chamber ${p.chamber ?? "?"}° of ${D.chamber}°` + (D.drops ? ` · heat re-sent ${D.drops}x after printer cut-offs` : "") + (D.note ? ` · ${D.note}` : "") + " · printing locked";
+  } else {
+    $("dry-msg").textContent = `Drying ${D.label} ended${D.why ? " (" + D.why + ")" : ""}. Take the spools out, then check the bed.`;
+    $("dry-line").textContent = "Printing stays locked until the camera sees an empty bed.";
+  }
+  $("dry-stop").style.display = D.phase === "drying" ? "" : "none";
+  $("dry-bed").style.display = $("dry-unlock").style.display = $("dry-out-row").style.display = D.phase === "bedcheck" ? "" : "none";
+  if (D.phase !== "bedcheck") $("dry-out").checked = false;
+  const canMore = D.phase === "bedcheck" && !String(D.why||"").startsWith("printer went");
+  $("dry-more-row").style.display = canMore ? "" : "none";
+  if (canMore && document.activeElement !== $("dry-more-h") && !$("dry-more-h").value) $("dry-more-h").value = D.hours || 2;
+  $("dry-bed").disabled = !!D.checking;
+  const c = D.check;
+  $("dry-check").innerHTML = D.phase === "bedcheck" && c ? `<div style="margin-top:8px">Check ${esc(c.time)}: <b>${c.passed ? "empty" : "not passed"}</b></div>` +
+    c.results.map(r => `<div class="dim">${esc(r.cam)} cam: ${esc(r.verdict)} - ${esc(r.reason||"")}</div>` + (r.image ? `<img src="/drying/${esc(r.image)}" alt="bed check frame">` : "")).join("") : "";
+}
+
+refresh(); loadJobs(); setCam(true);
+setInterval(refresh, 3000);
+setInterval(() => { if (!document.hidden && jobsCache.some(j => ["slicing","queued"].includes(j.state))) loadJobs(); }, 2000);
+setInterval(() => { if (!document.hidden && !document.querySelector("select:focus")) loadJobs(); }, 15000);
+</script>
+</body>
+</html>

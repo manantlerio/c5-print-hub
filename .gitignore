@@ -1,0 +1,21 @@
+# your own settings and keys (printer serial, check code, PIN, API key)
+config.json
+config.json.*
+*.bak*
+
+# local state: logs, jobs, watcher frames, drying, print records
+hub.log
+jobs/
+watch/
+drying/
+eta-trace.jsonl
+print-history.jsonl
+__pycache__/
+*.pyc
+
+# your Flash Studio export (holds your own presets)
+template/
+
+# emulator runtime copy and sample prints
+emulator/sim-hub/
+emulator/storage/
