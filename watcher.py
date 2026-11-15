@@ -347,8 +347,11 @@ class Watcher:
             if v.get("zoom") and os.path.exists(os.path.join(self.dir, zoom)):
                 shutil.copy(os.path.join(self.dir, zoom), os.path.join(self.keep, zoom))
             self.kept_at = time.time() if v["verdict"] == "ok" else self.kept_at
+        # "layer"/"layers" = the printer's own counter, which lags behind the real progress;
+        # "file_layer"/"file_layers"/"z" = the true place in the file - use these for progress
         line = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "file": s.get("file"), "layer": s.get("layer"),
-                "layers": s.get("layers"), "verdict": v["verdict"], "part": v.get("part"), "reason": v.get("reason"), "cost": v.get("cost"),
+                "layers": s.get("layers"), "file_layer": s.get("file_layer"), "file_layers": s.get("file_layers"),
+                "z": s.get("z"), "verdict": v["verdict"], "part": v.get("part"), "reason": v.get("reason"), "cost": v.get("cost"),
                 "image": v.get("image"), "zoom": v.get("zoom"), "kept": bool(keep)}
         with open(os.path.join(self.dir, "checks.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
@@ -497,7 +500,8 @@ class Watcher:
                 self.log(f"watch decide failed: {e}")
                 delay = 60 * float(self.cfg.get("watch_every_min", 5))
             next_check = time.time() + delay
-            self.log(f"watch {s.get('file')} layer {s.get('layer')}: {v}")
+            self.log(f"watch {s.get('file')} file layer {s.get('file_layer')}/{s.get('file_layers')} z {s.get('z')} "
+                     f"(printer layer {s.get('layer')}): {v}")
             try:
                 self.record(s, v)
             except Exception as e:
