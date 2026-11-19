@@ -281,8 +281,9 @@ Studio export), `jobs\`, `watch\`, `drying\`, `hub.log`.
 
 Copyright (C) 2026 manantlerio.
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
-Public License as published by the Free Software Foundation, version 3. It is distributed WITHOUT ANY WARRANTY. See
-[LICENSE](LICENSE) for the full text.
+Free for personal use, source available. C5 Print Hub is licensed under the PolyForm Noncommercial License 1.0.0:
+you can use it, change it and share it for any noncommercial purpose. Selling it, or using it in a business, needs a
+commercial licence, available from nozzletheory.com. It comes WITHOUT ANY WARRANTY. See [LICENSE](LICENSE) for the
+full text.
 
 `static\vendor\three-0.169.0\` is three.js, MIT licence (its LICENSE file is alongside).
